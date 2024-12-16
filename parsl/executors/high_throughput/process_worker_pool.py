@@ -810,7 +810,8 @@ def start_file_logger(filename, rank, name='parsl', level=logging.DEBUG, format_
 
 
 if __name__ == "__main__":
-
+    
+    __spec__ = None
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--debug", action='store_true',
                         help="Enable logging at DEBUG level")
