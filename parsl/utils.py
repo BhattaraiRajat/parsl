@@ -289,6 +289,10 @@ class AtomicIDCounter:
             self.count += 1
             return new_id
 
+    def get_last_id(self) -> int:
+        with self.lock:
+            return self.count - 1 if self.count > 0 else 0
+
 
 def setproctitle(title: str) -> None:
     if _setproctitle_enabled:
@@ -370,6 +374,7 @@ class AutoCancelTimer(threading.Timer):
     If `some_func()` returns before the delay is up, the timer will
     be cancelled.
     """
+
     def __enter__(self) -> "AutoCancelTimer":
         self.start()
         return self

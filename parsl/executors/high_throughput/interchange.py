@@ -278,7 +278,8 @@ class Interchange:
                                 'active': m['active'],
                                 'parsl_version': m['parsl_version'],
                                 'python_version': m['python_version'],
-                                'draining': m['draining']}
+                                'draining': m['draining'],
+                                'hostname': m['hostname']}
                         reply.append(resp)
 
                 elif command_req.startswith("HOLD_WORKER"):
