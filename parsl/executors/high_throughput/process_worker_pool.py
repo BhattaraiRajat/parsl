@@ -14,6 +14,8 @@ import sys
 import threading
 import time
 import uuid
+import signal
+from functools import partial
 from multiprocessing.managers import DictProxy
 from multiprocessing.sharedctypes import Synchronized
 from typing import Dict, List, Optional, Sequence
@@ -42,6 +44,37 @@ from parsl.version import VERSION as PARSL_VERSION
 
 HEARTBEAT_CODE = (2 ** 32) - 1
 DRAINED_CODE = (2 ** 32) - 2
+
+kill_event_global = False
+
+
+def read_and_remove_nodes_by_id(file_path, current_node):
+    with open(file_path, 'r') as file:
+        nodes = file.readlines()
+    # Strip newline characters from each ID
+    nodes_list = [node.strip() for node in nodes]
+
+    if current_node in nodes_list:
+        nodes_list.remove(current_node)
+        with open(file_path, 'w') as file:
+            for node in nodes_list:
+                file.write(f"{node}\n")
+        return True
+    else:
+        return False
+
+
+def signal_handler(logdir, sig, frame):
+    global kill_event_global
+    log_dir_parent_dir = logdir[:logdir.rfind('/')]
+    script_path = f"{log_dir_parent_dir}/submit_scripts"
+    node_to_kill_file_path = f"{script_path}/node_to_kill_file"
+    current_node = platform.node()
+    to_kill = read_and_remove_nodes_by_id(node_to_kill_file_path, current_node)
+    if to_kill:
+        kill_event_global = True
+    else:
+        kill_event_global = False
 
 
 class Manager:
@@ -489,6 +522,17 @@ class Manager:
 
         while not kill_event.is_set():
             try:
+                if kill_event_global == True:
+                    logger.info(
+                        "Start killing manager. Waiting for pending tasks to be 0")
+                    logger.info(
+                        f"Values are {self.pending_task_queue.qsize()} {self.ready_worker_count.value} {self.worker_count} {self.pending_result_queue.qsize()} {len(self._tasks_in_progress)}")
+                    while len(self._tasks_in_progress) != 0:
+                        pass
+                    logger.info(f"Setting kill event")
+                    kill_event.set()
+                    break
+
                 logger.debug("Starting monitor_queue.get()")
                 msg = self.monitoring_queue.get(block=True, timeout=poll_period_s)
             except queue.Empty:
@@ -601,7 +645,7 @@ def _init_mpi_env(mpi_launcher: str, resource_spec: Dict):
     update_resource_spec_env_vars(mpi_launcher=mpi_launcher, resource_spec=resource_spec, node_info=nodes_for_task)
 
 
-@wrap_with_logs(target="worker_log")
+@ wrap_with_logs(target="worker_log")
 def worker(
     worker_id: int,
     pool_id: str,
@@ -810,7 +854,7 @@ def start_file_logger(filename, rank, name='parsl', level=logging.DEBUG, format_
 
 
 if __name__ == "__main__":
-    
+
     __spec__ = None
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--debug", action='store_true',
@@ -898,6 +942,8 @@ if __name__ == "__main__":
         logger.info("Accelerators: {}".format(" ".join(args.available_accelerators)))
         logger.info("enable_mpi_mode: {}".format(args.enable_mpi_mode))
         logger.info("mpi_launcher: {}".format(args.mpi_launcher))
+
+        signal.signal(signal.SIGURG, partial(signal_handler, args.logdir))
 
         manager = Manager(task_port=args.task_port,
                           result_port=args.result_port,

@@ -45,6 +45,7 @@ class BlockProviderExecutor(ParslExecutor):
     any init_blocks parameter. Subclasses must implement that behaviour
     themselves.
     """
+
     def __init__(self, *,
                  provider: Optional[ExecutionProvider],
                  block_error_handler: Union[bool, Callable[[BlockProviderExecutor, Dict[str, JobStatus]], None]]):
@@ -354,3 +355,27 @@ class BlockProviderExecutor(ParslExecutor):
                 self._simulated_status[block_id] = s
             self.send_monitoring_info(new_status)
         return block_ids
+
+    def scale_in_pmix_facade(self, num_nodes: int, nodes: str) -> List[str]:
+
+        if not self.provider:
+            raise ScalingFailed(self, "No execution provider available")
+        block_id = str(self._block_id_counter.get_last_id())
+        job_id = self.blocks_to_job_id[block_id]
+        logger.info(f"Scaling in by {num_nodes} nodes on job {job_id}")
+        self.scale_in_pmix(block_id, job_id, num_nodes, nodes)
+
+    def scale_out_pmix_facade(self, num_nodes: int, nodes: str):
+        if not self.provider:
+            raise ScalingFailed(self, "No execution provider available")
+        block_id = str(self._block_id_counter.get_last_id())
+        nodes_list = nodes.split(",")
+        job_id = self.blocks_to_job_id[block_id]
+        logger.info(f"Scaling out by {num_nodes} nodes on job {job_id}")
+        self._launch_elastic_nodes_pmix(
+            num_nodes, block_id, nodes_list, job_id)
+
+    def _launch_elastic_nodes_pmix(self, num_nodes, block_id, nodes, job_id) -> Any:
+        launch_cmd = self._get_launch_command(block_id)
+        self.provider.submit_resource_change(
+            launch_cmd, "expand", num_nodes, nodes, job_id)

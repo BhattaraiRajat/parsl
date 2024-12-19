@@ -5,6 +5,7 @@ import math
 import time
 import warnings
 from typing import Dict, List, Optional, Sequence, TypedDict
+import json
 
 from parsl.executors import HighThroughputExecutor
 from parsl.executors.base import ParslExecutor
@@ -13,6 +14,28 @@ from parsl.jobs.states import JobState
 from parsl.process_loggers import wrap_with_logs
 
 logger = logging.getLogger(__name__)
+
+
+def read_and_remove_job_by_id(file_path, job_id):
+    # Read the JSON data from the file
+    scale, elasticity_type, num_nodes, nodes, start_after = None, None, None, None, None
+    with open(file_path, 'r') as file:
+        data = json.load(file)
+
+    for job in data["jobs"]:
+        if job["id"] == str(job_id):
+            scale, elasticity_type, num_nodes, nodes, start_after = job.get("scale"), job.get(
+                "elasticity_type"), job.get("num_nodes"), job.get("nodes"), job.get("start_after")
+
+    # Modify the data by removing the entry with the specified id
+    data['jobs'] = [job for job in data['jobs']
+                    if int(job.get('id')) != job_id]
+
+    # Write the updated data back to the file
+    with open(file_path, 'w') as file:
+        json.dump(data, file, indent=4)
+
+    return scale, elasticity_type, num_nodes, nodes, start_after
 
 
 class ExecutorState(TypedDict):
@@ -125,16 +148,18 @@ class Strategy:
 
     """
 
-    def __init__(self, *, strategy: Optional[str], max_idletime: float) -> None:
+    def __init__(self, *, strategy: Optional[str], policy_file: Optional[str], max_idletime: float) -> None:
         """Initialize strategy."""
         self.executors: Dict[str, ExecutorState]
         self.executors = {}
         self.max_idletime = max_idletime
+        self.policy_file = policy_file
 
         self.strategies = {None: self._strategy_init_only,
                            'none': self._strategy_init_only,
                            'simple': self._strategy_simple,
-                           'htex_auto_scale': self._strategy_htex_auto_scale}
+                           'htex_auto_scale': self._strategy_htex_auto_scale,
+                           'pmix_scale_simple': self._strategy_pmix_scale}
 
         if strategy is None:
             warnings.warn("literal None for strategy choice is deprecated. Use string 'none' instead.",
@@ -178,6 +203,30 @@ class Strategy:
         per block is close to 1.
         """
         self._general_strategy(executors, strategy_type='htex')
+
+    def _strategy_pmix_scale(self, executors: List[BlockProviderExecutor]) -> None:
+        for executor in executors:
+            label = executor.label
+            logger.debug(f"Strategizing for executor {label}")
+
+            if self.executors[label]['first']:
+                logger.debug(
+                    f"Scaling out {executor.provider.init_blocks} initial blocks for {label}")
+                executor.scale_out_facade(executor.provider.init_blocks)
+                self.executors[label]['first'] = False
+
+            # policy file induced elasticity
+            job_id = executor.provider.job_id
+            scale, elasticity_type, num_nodes, nodes, start_after = read_and_remove_job_by_id(
+                self.policy_file, job_id)
+            if elasticity_type == "manager":
+                time.sleep(int(start_after))
+                if scale == "expand":
+                    executor.scale_out_pmix_facade(num_nodes, nodes)
+                elif scale == "shrink":
+                    executor.scale_in_pmix_facade(num_nodes, nodes)
+                else:
+                    logger.debug(f"Error config")
 
     @wrap_with_logs
     def _general_strategy(self, executors: List[BlockProviderExecutor], *, strategy_type: str) -> None:

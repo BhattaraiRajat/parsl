@@ -784,6 +784,24 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin, UsageIn
 
         return block_ids_killed
 
+    def _remove_elastic_nodes_pmix(self, num_nodes, block_id, nodes, job_id):
+        launch_cmd = self._get_launch_command(block_id)
+        self.provider.submit_resource_change(
+            launch_cmd, "shrink", num_nodes, nodes, job_id)
+
+    def scale_in_pmix(self, block_id: int, job_id: int, num_nodes: int, nodes: str):
+        nodes_list = nodes.split(",")
+        managers = self.connected_managers()
+        for manager in managers:
+            if not manager['active']:
+                continue
+            manager_id = manager['manager']
+            hostname = manager['hostname']
+            if hostname in nodes_list:
+                self.hold_worker(manager_id)
+        self._remove_elastic_nodes_pmix(
+            num_nodes, block_id, nodes_list, job_id)
+
     def _get_launch_command(self, block_id: str) -> str:
         if self.launch_cmd is None:
             raise ScalingFailed(self, "No launch command")
