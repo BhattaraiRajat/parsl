@@ -12,6 +12,7 @@ from parsl.providers.lsf.lsf import LSFProvider
 from parsl.providers.pbspro.pbspro import PBSProProvider
 from parsl.providers.slurm.slurm import SlurmProvider
 from parsl.providers.torque.torque import TorqueProvider
+from parsl.providers.pmix.pmix import PMIxProvider
 
 __all__ = ['LocalProvider',
            'CondorProvider',
@@ -23,4 +24,5 @@ __all__ = ['LocalProvider',
            'AWSProvider',
            'GoogleCloudProvider',
            'KubernetesProvider',
-           'AzureProvider']
+           'AzureProvider',
+           'PMIxProvider']
