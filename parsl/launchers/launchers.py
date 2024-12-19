@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 class SimpleLauncher(Launcher):
     """ Does no wrapping. Just returns the command as-is
     """
+
     def __init__(self, debug: bool = True) -> None:
         super().__init__(debug=debug)
 
@@ -123,6 +124,7 @@ class GnuParallelLauncher(Launcher):
       target nodes.
     - The provider makes available the $PBS_NODEFILE environment variable
     """
+
     def __init__(self, debug: bool = True):
         super().__init__(debug=debug)
 
@@ -186,6 +188,7 @@ class MpiExecLauncher(Launcher):
     - mpiexec is installed and can be located in $PATH
     - The provider makes available the $PBS_NODEFILE environment variable
     """
+
     def __init__(self, debug: bool = True, bind_cmd: str = '--bind-to', overrides: str = ''):
         """
 
@@ -251,6 +254,7 @@ class MpiRunLauncher(Launcher):
     - mpirun is installed and can be located in $PATH
     - The provider makes available the $PBS_NODEFILE environment variable
     """
+
     def __init__(self, debug: bool = True, bash_location: str = '/bin/bash', overrides: str = ''):
         super().__init__(debug=debug)
         self.bash_location = bash_location
@@ -342,6 +346,7 @@ class SrunMPILauncher(Launcher):
     at the same time. Workers should be launched with independent Srun calls so as to setup the
     environment for MPI application launch.
     """
+
     def __init__(self, debug: bool = True, overrides: str = ''):
         """
         Parameters
@@ -414,6 +419,7 @@ class AprunLauncher(Launcher):
     to launch multiple cmd invocations in parallel on a single job allocation
 
     """
+
     def __init__(self, debug: bool = True, overrides: str = ''):
         """
         Parameters
@@ -462,6 +468,7 @@ class JsrunLauncher(Launcher):
     to launch multiple cmd invocations in parallel on a single job allocation
 
     """
+
     def __init__(self, debug: bool = True, overrides: str = ''):
         """
         Parameters
@@ -503,3 +510,29 @@ wait
            overrides=self.overrides,
            debug=debug_num)
         return x
+
+
+class SimplePMIxLauncher(Launcher):
+    """ Does no wrapping. Just returns the command as-is
+    """
+
+    def __init__(self, debug: bool = True) -> None:
+        super().__init__(debug=debug)
+
+    def __call__(self, command: str, dvm_uri: str, local_hostfile: str, script_dir: str, worker_init_env: str) -> str:
+        command = "prun -x SCRIPT_DIR={3} --dvm-uri file:{0} --hostfile {1} -n 1 {4}/bin/python {4}/bin/{2} &".format(
+            dvm_uri, local_hostfile, command, script_dir, worker_init_env)
+        return command
+
+
+class PMIxLauncher(Launcher):
+    """ Does PMIx based wrapping.
+    """
+
+    def __init__(self, debug: bool = True) -> None:
+        super().__init__(debug=debug)
+
+    def __call__(self, command: str, nodes_per_block: int, dvm_uri: str, local_hostfile: str, worker_init_env: str) -> str:
+        command = "prun --dvm-uri file:{0} --hostfile {1} --map-by node --bind-to none -n {2} {4}/bin/python {4}/bin/{3} &".format(
+            dvm_uri, local_hostfile, nodes_per_block, command, worker_init_env)
+        return command
