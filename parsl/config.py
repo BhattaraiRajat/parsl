@@ -117,6 +117,7 @@ class Config(RepresentationMixin, UsageInformation):
                  run_dir: str = 'runinfo',
                  std_autopath: Optional[Callable] = None,
                  strategy: Optional[str] = 'simple',
+                 strategy_policy_file: Optional[str] = '',
                  strategy_period: Union[float, int] = 5,
                  max_idletime: float = 120.0,
                  monitoring: Optional[MonitoringHub] = None,
@@ -155,6 +156,7 @@ class Config(RepresentationMixin, UsageInformation):
         self.run_dir = run_dir
         self.strategy = strategy
         self.strategy_period = strategy_period
+        self.strategy_policy_file = strategy_policy_file
         self.max_idletime = max_idletime
         self.validate_usage_tracking(usage_tracking)
         self.usage_tracking = usage_tracking

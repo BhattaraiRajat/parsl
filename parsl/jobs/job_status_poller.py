@@ -9,10 +9,11 @@ logger = logging.getLogger(__name__)
 
 
 class JobStatusPoller(Timer):
-    def __init__(self, *, strategy: Optional[str], max_idletime: float,
+    def __init__(self, *, strategy: Optional[str], policy_file: Optional[str], max_idletime: float,
                  strategy_period: Union[float, int]) -> None:
         self._executors = []  # type: List[BlockProviderExecutor]
         self._strategy = Strategy(strategy=strategy,
+                                  policy_file=policy_file,
                                   max_idletime=max_idletime)
         super().__init__(self.poll, interval=strategy_period, name="JobStatusPoller")
 

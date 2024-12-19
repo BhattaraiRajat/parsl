@@ -140,20 +140,20 @@ class DataFlowKernel:
             self.workflow_version = self.monitoring.workflow_version
 
         workflow_info = {
-                'python_version': "{}.{}.{}".format(sys.version_info.major,
-                                                    sys.version_info.minor,
-                                                    sys.version_info.micro),
-                'parsl_version': get_version(),
-                "time_began": self.time_began,
-                'time_completed': None,
-                'run_id': self.run_id,
-                'workflow_name': self.workflow_name,
-                'workflow_version': self.workflow_version,
-                'rundir': self.run_dir,
-                'tasks_completed_count': self.task_state_counts[States.exec_done],
-                'tasks_failed_count': self.task_state_counts[States.failed],
-                'user': getuser(),
-                'host': gethostname(),
+            'python_version': "{}.{}.{}".format(sys.version_info.major,
+                                                sys.version_info.minor,
+                                                sys.version_info.micro),
+            'parsl_version': get_version(),
+            "time_began": self.time_began,
+            'time_completed': None,
+            'run_id': self.run_id,
+            'workflow_name': self.workflow_name,
+            'workflow_version': self.workflow_version,
+            'rundir': self.run_dir,
+            'tasks_completed_count': self.task_state_counts[States.exec_done],
+            'tasks_failed_count': self.task_state_counts[States.failed],
+            'user': getuser(),
+            'host': gethostname(),
         }
 
         if self.monitoring:
@@ -177,6 +177,7 @@ class DataFlowKernel:
         # job_status_poller.add_executors.
         self.job_status_poller = JobStatusPoller(strategy=self.config.strategy,
                                                  strategy_period=self.config.strategy_period,
+                                                 policy_file=self.config.strategy_policy_file,
                                                  max_idletime=self.config.max_idletime)
 
         self.executors: Dict[str, ParslExecutor] = {}
