@@ -75,6 +75,11 @@ def remote_side_bash_executor(func, *args, **kwargs):
     std_err = open_std_fd('stderr')
     timeout = kwargs.get('walltime')
 
+    if "prun" in executable:
+        dvm_path = os.environ.get('DVM_URI')
+        prun_command = "prun --dvm-uri file:{0} ".format(dvm_path)
+        executable = executable.replace("prun ", prun_command)
+
     if std_err is not None:
         print('--> executable follows <--\n{}\n--> end executable <--'.format(executable), file=std_err, flush=True)
 

@@ -13,21 +13,23 @@ from parsl.jobs.states import JobState, JobStatus
 from parsl.utils import wtime_to_minutes, RepresentationMixin
 from parsl.providers.cluster_provider import ClusterProvider
 
-from parsl.launchers import PMIxLauncher
+from parsl.launchers import PMIxLauncher, SimplePMIxLauncher
 
 logger = logging.getLogger(__name__)
 
 
-def write_hostfile(nodes, hostfile_path, slots, shrink=False):
+def write_hostfile(nodes, hostfile_path, slots, shrink=False, launcher=PMIxLauncher()):
     """Write node identifiers back to the hostfile."""
     with open(hostfile_path, 'w') as file:
         if shrink:
             file.writelines(
                 f"{node.strip()} slots=-{slots} \n" for node in nodes)
         else:
+            # if isinstance(launcher, SimplePMIxLauncher):
+            #     file.writelines(f"{node.strip()} slots={slots + 1 if i == 0 else slots}\n" for i, node in enumerate(nodes))
+            # else:
             file.writelines(
                 f"{node.strip()} slots={slots} \n" for node in nodes)
-
 
 def launch(run_command):
     local_env = os.environ.copy()
@@ -45,7 +47,7 @@ def start_dvm(local_hostfile, dvm_uri):
     # run DVM
     local_env = os.environ.copy()
     envs = copy.deepcopy(local_env)
-    cmd = "prte --report-uri {0} --hostfile {1} --prtemca plm ^slurm --daemonize".format(
+    cmd = "prte --pmixmca ptl_base_if_include ib0 --report-uri {0} --hostfile {1} --prtemca plm ^slurm --daemonize".format(
         dvm_uri, local_hostfile)  # --pmixmca ptl_base_if_include ib0
     logger.info(cmd)
     proc = subprocess.run(
@@ -142,7 +144,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
         local_hostfile = "{0}/hostfile".format(script_path)
         dvm_uri = "{0}/dvm.uri".format(script_path)
 
-        write_hostfile(self.node_list, local_hostfile, self.cores_per_node)
+        write_hostfile(self.node_list, local_hostfile, self.cores_per_node, False, self.launcher)
 
         start_dvm(local_hostfile, dvm_uri)
 
@@ -158,7 +160,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
 
         return self.job_id
 
-    def submit_resource_change(self, command, scale, num_nodes, nodes, job_id):
+    def submit_resource_change(self, command, scale, num_nodes, nodes, job_id, elasticity_type="manager"):
         """Submit the command as a pmix job change.
 
         Parameters
@@ -174,55 +176,72 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
         script_path = os.path.abspath(script_path)
         # hostfile and dvm file paths
         dvm_uri = "{0}/dvm.uri".format(script_path)
+        logger.info("Elasticity Type for resource change is %s", elasticity_type)
 
-        for node in nodes:
-            local_add_hostfile = "{0}/add_hostfile{1}".format(
-                script_path, self.elastic_nodes_id)
+        if elasticity_type == "manager":
+            for node in nodes:
+                local_add_hostfile = "{0}/add_hostfile{1}".format(
+                    script_path, self.elastic_nodes_id)
+                self.elastic_nodes_id += 1
+
+                if scale == "expand":
+                    write_hostfile([node], local_add_hostfile, self.cores_per_node)
+                    run_command = f"prun --dvm-uri file:{dvm_uri} --add-hostfile {local_add_hostfile} --hostfile {local_add_hostfile} --map-by node --bind-to none -n 1 {self.worker_init_env}/bin/python {self.worker_init_env}/bin/{command} &"
+                    proc = launch(run_command)
+                    # fix parallel runs bug on dvm change
+                    time.sleep(1)
+                    logger.info(
+                        "Allocated with node: %s on job id: %s", node, job_id)
+                    print(
+                        f"Finished expansion of jobid: {job_id} with node {node}")
+                    self.resources[job_id]['pid_and_nodes'].append(
+                        (proc.pid, [node.strip()]))
+                elif scale == "shrink":
+                    node_to_kill_file_path = f"{script_path}/node_to_kill_file"
+                    write_hostfile([node], local_add_hostfile,
+                                self.cores_per_node, shrink=True)
+
+                    pid_and_nodes = self.resources[job_id]['pid_and_nodes']
+
+                    for pid, pid_nodes in pid_and_nodes:
+                        if node.strip() in pid_nodes:
+                            logger.info("Found node and pid {node} {pid}")
+                            with open(node_to_kill_file_path, 'w') as file:
+                                file.write(f"{node}\n")
+                            actual_pid = int(pid) + 1
+                            # Terminate the process
+                            try:
+                                # Try to terminate the process gracefully
+                                os.kill(actual_pid, signal.SIGURG)
+                                logger.info("Killing Gracefully %d Check.", pid)
+                            except ProcessLookupError:
+                                print(f"No process with PID {pid} found.")
+                            run_command = f"prun --dvm-uri file:{dvm_uri} --add-hostfile {local_add_hostfile} -n {1} hostname &"
+                            proc = launch(run_command)
+
+                            self.resources[job_id]['pid_and_nodes'] = [
+                                tup for tup in pid_and_nodes if node not in tup[1]]
+                            print(
+                                f"Finished shrinkage of jobid: {job_id} with node {node}")
+                            # fix parallel runs bug on dvm change
+                            time.sleep(1)
+                else:
+                    logger.info("Incorrect scaling instruction.")
+        elif elasticity_type == "worker":
+            worker_change_file = f"{script_path}/worker_change_file"
+            local_add_hostfile = "{0}/add_hostfile{1}".format( script_path, self.elastic_nodes_id)
             self.elastic_nodes_id += 1
-
             if scale == "expand":
-                write_hostfile([node], local_add_hostfile, self.cores_per_node)
-                run_command = f"prun --dvm-uri file:{dvm_uri} --add-hostfile {local_add_hostfile} --hostfile {local_add_hostfile} --map-by node --bind-to none -n 1 {self.worker_init_env}/bin/python {self.worker_init_env}/bin/{command} &"
-                proc = launch(run_command)
-                # fix parallel runs bug on dvm change
-                time.sleep(1)
-                logger.info(
-                    "Allocated with node: %s on job id: %s", node, job_id)
-                print(
-                    f"Finished expansion of jobid: {job_id} with node {node}")
-                self.resources[job_id]['pid_and_nodes'].append(
-                    (proc.pid, [node.strip()]))
+                write_hostfile(nodes, local_add_hostfile, self.cores_per_node)
             elif scale == "shrink":
-                node_to_kill_file_path = f"{script_path}/node_to_kill_file"
-                write_hostfile([node], local_add_hostfile,
-                               self.cores_per_node, shrink=True)
-
-                pid_and_nodes = self.resources[job_id]['pid_and_nodes']
-
-                for pid, pid_nodes in pid_and_nodes:
-                    if node.strip() in pid_nodes:
-                        logger.info("Found node and pid {node} {pid}")
-                        with open(node_to_kill_file_path, 'w') as file:
-                            file.write(f"{node}\n")
-                        actual_pid = int(pid) + 1
-                        # Terminate the process
-                        try:
-                            # Try to terminate the process gracefully
-                            os.kill(actual_pid, signal.SIGURG)
-                            logger.info("Killing Gracefully %d Check.", pid)
-                        except ProcessLookupError:
-                            print(f"No process with PID {pid} found.")
-                        run_command = f"prun --dvm-uri file:{dvm_uri} --add-hostfile {local_add_hostfile} -n {1} hostname &"
-                        proc = launch(run_command)
-
-                        self.resources[job_id]['pid_and_nodes'] = [
-                            tup for tup in pid_and_nodes if node not in tup[1]]
-                        print(
-                            f"Finished shrinkage of jobid: {job_id} with node {node}")
-                        # fix parallel runs bug on dvm change
-                        time.sleep(1)
+                write_hostfile(nodes, local_add_hostfile, self.cores_per_node, shrink=True)
             else:
-                logger.info("Incorrect scaling instruction.")
+                logger.info("Incorrect scaling type.")
+            logger.info("Scaling the DVM with add hosts")
+            with open(worker_change_file, 'w') as file:
+                file.write(f"{num_nodes} {scale} {local_add_hostfile}\n")
+        else:
+            logger.info("Incorrect elasticity type.")
 
     def cancel(self, job_ids):
         ''' Cancels the jobs specified by a list of job ids

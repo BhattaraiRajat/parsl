@@ -519,9 +519,9 @@ class SimplePMIxLauncher(Launcher):
     def __init__(self, debug: bool = True) -> None:
         super().__init__(debug=debug)
 
-    def __call__(self, command: str, dvm_uri: str, local_hostfile: str, script_dir: str, worker_init_env: str) -> str:
-        command = "prun -x SCRIPT_DIR={3} --dvm-uri file:{0} --hostfile {1} -n 1 {4}/bin/python {4}/bin/{2} &".format(
-            dvm_uri, local_hostfile, command, script_dir, worker_init_env)
+    def __call__(self, command: str, nodes_per_block: int, dvm_uri: str, local_hostfile: str, worker_init_env: str) -> str:
+        # command = "prun -x DVM_URI={0} --dvm-uri file:{0} --hostfile {1} -n 1 {3}/bin/python {3}/bin/{2} &".format(dvm_uri, local_hostfile, command, worker_init_env)
+        command = "DVM_URI={0} {3}/bin/python {3}/bin/{2} &".format(dvm_uri, local_hostfile, command, worker_init_env)
         return command
 
 
@@ -533,6 +533,6 @@ class PMIxLauncher(Launcher):
         super().__init__(debug=debug)
 
     def __call__(self, command: str, nodes_per_block: int, dvm_uri: str, local_hostfile: str, worker_init_env: str) -> str:
-        command = "prun --dvm-uri file:{0} --hostfile {1} --map-by node --bind-to none -n {2} {4}/bin/python {4}/bin/{3} &".format(
+        command = "prun -x DVM_URI={0} --dvm-uri file:{0} --hostfile {1} --map-by node --bind-to none -n {2} {4}/bin/python {4}/bin/{3} &".format(
             dvm_uri, local_hostfile, nodes_per_block, command, worker_init_env)
         return command

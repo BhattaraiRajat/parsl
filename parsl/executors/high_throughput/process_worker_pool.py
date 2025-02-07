@@ -47,7 +47,6 @@ DRAINED_CODE = (2 ** 32) - 2
 
 kill_event_global = False
 
-
 def read_and_remove_nodes_by_id(file_path, current_node):
     with open(file_path, 'r') as file:
         nodes = file.readlines()
@@ -63,18 +62,21 @@ def read_and_remove_nodes_by_id(file_path, current_node):
     else:
         return False
 
-
 def signal_handler(logdir, sig, frame):
     global kill_event_global
     log_dir_parent_dir = logdir[:logdir.rfind('/')]
     script_path = f"{log_dir_parent_dir}/submit_scripts"
     node_to_kill_file_path = f"{script_path}/node_to_kill_file"
-    current_node = platform.node()
-    to_kill = read_and_remove_nodes_by_id(node_to_kill_file_path, current_node)
-    if to_kill:
-        kill_event_global = True
+
+    if os.path.exists(node_to_kill_file_path) and os.path.getsize(node_to_kill_file_path) > 0:
+        current_node = platform.node()
+        to_kill = read_and_remove_nodes_by_id(node_to_kill_file_path, current_node)
+        if to_kill:
+            kill_event_global = True
+        else:
+            kill_event_global = False
     else:
-        kill_event_global = False
+        pass
 
 
 class Manager:
@@ -469,7 +471,7 @@ class Manager:
         logger.critical("Exiting")
 
     @wrap_with_logs
-    def worker_watchdog(self, kill_event: threading.Event):
+    def worker_watchdog(self, kill_event: threading.Event, change_event):
         """Keeps workers alive.
 
         Parameters:
@@ -481,7 +483,48 @@ class Manager:
         logger.debug("Starting worker watchdog")
 
         while not kill_event.wait(self.heartbeat_period):
-            for worker_id, p in self.procs.items():
+            if os.environ.get('DVM_URI'):
+                dvm_path = os.environ['DVM_URI']
+                script_path = os.path.dirname(dvm_path)
+                worker_change_file = f"{script_path}/worker_change_file"
+                if os.path.exists(worker_change_file) and os.path.getsize(worker_change_file) > 0:
+                    with open(worker_change_file, 'r') as file:
+                        content = file.readline().strip()  # Read the first line and remove extra spaces
+                    change_worker_count, scale_type, local_add_hostfile = content.split(" ")
+                    change_event.set()
+
+                    old_worker_count = self.worker_count
+                    worker_change_count = int(change_worker_count)
+                    if scale_type == "expand":
+                        logger.info("Starting worker pool expansion")
+                        self.worker_count += worker_change_count
+                        os.environ['PARSL_WORKER_COUNT'] = str(self.worker_count)
+                        for id in range(worker_change_count):
+                            p = self._start_worker(old_worker_count+id)
+                            self.procs[old_worker_count+id] = p
+                            logger.info("Worker {} has been started".format(old_worker_count+id))
+                    elif scale_type == "shrink":
+                        logger.info("Starting worker pool shrinkage")
+                        self.worker_count = self.worker_count - worker_change_count
+                        os.environ['PARSL_WORKER_COUNT'] = str(self.worker_count)
+                        worker_id = old_worker_count
+                        while (worker_change_count > 0):
+                            worker_id = worker_id - 1
+                            while worker_id in self._tasks_in_progress.keys():
+                                pass
+                            self.procs[worker_id].terminate()
+                            self.procs[worker_id].join()
+                            logger.info("Worker {} joined successfully".format(
+                                self.procs[worker_id]))
+                            self.procs.pop(worker_id)
+                            worker_change_count = worker_change_count-1
+                    else:
+                        logger.info("Incorrect Scaling Type")
+                    while change_event.is_set():
+                        pass
+
+            current_procs = self.procs.copy()
+            for worker_id, p in current_procs.items():
                 if not p.is_alive():
                     logger.error("Worker {} has died".format(worker_id))
                     try:
@@ -521,12 +564,12 @@ class Manager:
         poll_period_s = max(10, self.poll_period) / 1000    # Must be at least 10 ms
 
         while not kill_event.is_set():
+            global kill_event_global
             try:
                 if kill_event_global == True:
                     logger.info(
                         "Start killing manager. Waiting for pending tasks to be 0")
-                    logger.info(
-                        f"Values are {self.pending_task_queue.qsize()} {self.ready_worker_count.value} {self.worker_count} {self.pending_result_queue.qsize()} {len(self._tasks_in_progress)}")
+                    # logger.info(f"Values are {self.pending_task_queue.qsize()} {self.ready_worker_count.value} {self.worker_count} {self.pending_result_queue.qsize()} {len(self._tasks_in_progress)}")
                     while len(self._tasks_in_progress) != 0:
                         pass
                     logger.info(f"Setting kill event")
@@ -552,6 +595,7 @@ class Manager:
         TODO: Move task receiving to a thread
         """
         self._kill_event = threading.Event()
+        self._change_event =  self._mp_manager.Event()
         self._tasks_in_progress = self._mp_manager.dict()
 
         self.procs = {}
@@ -568,7 +612,7 @@ class Manager:
                                                       args=(self._kill_event,),
                                                       name="Result-Pusher")
         self._worker_watchdog_thread = threading.Thread(target=self.worker_watchdog,
-                                                        args=(self._kill_event,),
+                                                        args=(self._kill_event, self._change_event,),
                                                         name="worker-watchdog")
         self._monitoring_handler_thread = threading.Thread(target=self.handle_monitoring_messages,
                                                            args=(self._kill_event,),
@@ -623,6 +667,7 @@ class Manager:
                 args.logdir,
                 args.debug,
                 self.mpi_launcher,
+                self._change_event,
             ),
             name="HTEX-Worker-{}".format(worker_id),
         )
@@ -663,6 +708,7 @@ def worker(
     logdir: str,
     debug: bool,
     mpi_launcher: str,
+    change_event,
 ):
     # override the global logger inherited from the __main__ process (which
     # usually logs to manager.log) with one specific to this worker.
@@ -780,11 +826,38 @@ def worker(
             return True
 
     worker_enqueued = False
+
     while manager_is_alive():
         if not worker_enqueued:
             with ready_worker_count.get_lock():
                 ready_worker_count.value += 1
             worker_enqueued = True
+
+        if change_event.is_set():
+            if(worker_id == 0):
+                logger.info("Executing resource change in DVM")
+                # wait for dummy tasks to run alone
+                while(len(tasks_in_progress)!=0):
+                    pass
+                dvm_path = os.environ['DVM_URI']
+                script_path = os.path.dirname(dvm_path)
+                worker_change_file = f"{script_path}/worker_change_file"
+                if os.path.exists(worker_change_file) and os.path.getsize(worker_change_file) > 0:
+                    with open(worker_change_file, 'r') as file:
+                        content = file.readline().strip()  # Read the first line and remove extra spaces
+                    change_worker_count, scale_type, local_add_hostfile = content.split(" ")
+                    with open(worker_change_file, 'w') as file:
+                        file.truncate()  # Empty the file content
+                    cmd =  "~/pmix_recent/install/prrte/bin/prun --dvm-uri file:{0} --add-hostfile {1} -np 2 hostname".format(dvm_path, local_add_hostfile)
+                    # run dummy tasks
+                    logger.info(cmd)
+                    proc = subprocess.run(cmd, shell=True)
+                    # clear change event
+                    change_event.clear()
+            else:
+                logger.info("Waiting for change event to finish from worker {}".format(worker_id))
+                while (change_event.is_set()):
+                    pass
 
         try:
             # The worker will receive {'task_id':<tid>, 'buffer':<buf>}

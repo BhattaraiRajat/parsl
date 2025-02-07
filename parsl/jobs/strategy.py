@@ -220,6 +220,7 @@ class Strategy:
             scale, elasticity_type, num_nodes, nodes, start_after = read_and_remove_job_by_id(
                 self.policy_file, job_id)
             if elasticity_type == "manager":
+                logger.info(f"Scaling Managers")
                 time.sleep(int(start_after))
                 if scale == "expand":
                     executor.scale_out_pmix_facade(num_nodes, nodes)
@@ -227,6 +228,13 @@ class Strategy:
                     executor.scale_in_pmix_facade(num_nodes, nodes)
                 else:
                     logger.debug(f"Error config")
+            elif elasticity_type == "worker":
+                logger.info(f"Scaling Workers")
+                time.sleep(int(start_after))
+                executor.scale_worker_pmix_facade(scale, num_nodes, nodes)
+            else:
+                logger.info(
+                    f"Error Elasticity Type:  {elasticity_type}")
 
     @wrap_with_logs
     def _general_strategy(self, executors: List[BlockProviderExecutor], *, strategy_type: str) -> None:

@@ -379,3 +379,14 @@ class BlockProviderExecutor(ParslExecutor):
         launch_cmd = self._get_launch_command(block_id)
         self.provider.submit_resource_change(
             launch_cmd, "expand", num_nodes, nodes, job_id)
+
+    def scale_worker_pmix_facade(self, scale, num_nodes, nodes) -> Any:
+        if not self.provider:
+            raise ScalingFailed(self, "No execution provider available")
+        block_id = str(self._block_id_counter.get_last_id())
+        job_id = self.blocks_to_job_id[block_id]
+        nodes_list = nodes.split(",")
+        launch_cmd = self._get_launch_command(block_id)
+        logger.info("Submitting for Worker Change")
+        self.provider.submit_resource_change(
+            launch_cmd, scale, num_nodes, nodes_list, job_id, "worker")
