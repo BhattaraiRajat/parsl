@@ -25,9 +25,6 @@ def write_hostfile(nodes, hostfile_path, slots, shrink=False, launcher=PMIxLaunc
             file.writelines(
                 f"{node.strip()} slots=-{slots} \n" for node in nodes)
         else:
-            # if isinstance(launcher, SimplePMIxLauncher):
-            #     file.writelines(f"{node.strip()} slots={slots + 1 if i == 0 else slots}\n" for i, node in enumerate(nodes))
-            # else:
             file.writelines(
                 f"{node.strip()} slots={slots} \n" for node in nodes)
 
@@ -47,8 +44,8 @@ def start_dvm(local_hostfile, dvm_uri):
     # run DVM
     local_env = os.environ.copy()
     envs = copy.deepcopy(local_env)
-    cmd = "prte --pmixmca ptl_base_if_include ib0 --report-uri {0} --hostfile {1} --prtemca plm ^slurm --daemonize".format(
-        dvm_uri, local_hostfile)  # --pmixmca ptl_base_if_include ib0
+    cmd = "/home/rbhattara/pmix_recent/install/prrte/bin/prte --pmixmca ptl_base_if_include ib0 --report-uri {0} --hostfile {1} --prtemca plm ^slurm --daemonize".format(
+        dvm_uri, local_hostfile)
     logger.info(cmd)
     proc = subprocess.run(
         cmd,
@@ -63,7 +60,7 @@ def stop_dvm(dvm_uri):
     # stop DVM
     local_env = os.environ.copy()
     envs = copy.deepcopy(local_env)
-    cmd = "pterm --report-uri file:{0}".format(dvm_uri)
+    cmd = "/home/rbhattara/pmix_recent/install/prrte/bin/pterm --dvm-uri file:{0}".format(dvm_uri)
     logger.info(cmd)
     proc = subprocess.run(
         cmd,
@@ -80,7 +77,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
     @typeguard.typechecked
     def __init__(self,
                  nodes_per_block: int = 1,
-                 cores_per_node: Optional[int] = None,
+                 cores_per_node: Optional[int] = 64,
                  init_blocks: int = 1,
                  min_blocks: int = 0,
                  max_blocks: int = 1,
@@ -186,7 +183,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
 
                 if scale == "expand":
                     write_hostfile([node], local_add_hostfile, self.cores_per_node)
-                    run_command = f"prun --dvm-uri file:{dvm_uri} --add-hostfile {local_add_hostfile} --hostfile {local_add_hostfile} --map-by node --bind-to none -n 1 {self.worker_init_env}/bin/python {self.worker_init_env}/bin/{command} &"
+                    run_command = f"/home/rbhattara/pmix_recent/install/prrte/bin/prun -x PYTHONPATH=/home/rbhattara/spack/opt/spack/linux-almalinux8-thunderx2/gcc-8.5.0/py-xtb-22.1-dktaggdgke2gmsbsnwdk6ztad4dptsog/lib/python3.11/site-packages -x DVM_URI={dvm_uri} --dvm-uri file:{dvm_uri} --add-hostfile {local_add_hostfile} --hostfile {local_add_hostfile} --map-by node --bind-to none -n 1 {self.worker_init_env}/bin/python {self.worker_init_env}/bin/{command} &"
                     proc = launch(run_command)
                     # fix parallel runs bug on dvm change
                     time.sleep(1)
@@ -216,7 +213,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
                                 logger.info("Killing Gracefully %d Check.", pid)
                             except ProcessLookupError:
                                 print(f"No process with PID {pid} found.")
-                            run_command = f"prun --dvm-uri file:{dvm_uri} --add-hostfile {local_add_hostfile} -n {1} hostname &"
+                            run_command = f"/home/rbhattara/pmix_recent/install/prrte/bin/prun --dvm-uri file:{dvm_uri} --add-hostfile {local_add_hostfile} -n {1} hostname &"
                             proc = launch(run_command)
 
                             self.resources[job_id]['pid_and_nodes'] = [
@@ -264,23 +261,29 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
                 pid = int(pid_and_node[0]) + 1
                 nodes = pid_and_node[1]
 
+                if isinstance(self.launcher, SimplePMIxLauncher):
+                    node_to_kill_file_path = f"{script_path}/node_to_kill_file"
+                    with open(node_to_kill_file_path, 'w') as file:
+                        file.write(f"st-master\n")
                 # Terminate the process
                 try:
                     # Try to terminate the process gracefully
-                    os.kill(pid, signal.SIGTERM)
+                    if isinstance(self.launcher, SimplePMIxLauncher):
+                        os.kill(pid, signal.SIGURG)
+                    else:
+                        os.kill(pid, signal.SIGTERM)
                     logger.info("Killing Gracefully %d Check.", pid)
                 except ProcessLookupError:
                     print(f"No process with PID {pid} found.")
-
                 logger.info("%d killed successfully.", pid)
 
-                local_add_hostfile = "{0}/add_hostfile{1}".format(
-                    script_path, self.elastic_nodes_id)
-                self.elastic_nodes_id += 1
-                write_hostfile(nodes, local_add_hostfile,
-                               self.cores_per_node, shrink=True)
-                run_command = f"prun --dvm-uri file:{dvm_uri} --add-hostfile {local_add_hostfile} -n {1} hostname &"
-                proc = launch(run_command)
+                # local_add_hostfile = "{0}/add_hostfile{1}".format(
+                #     script_path, self.elastic_nodes_id)
+                # self.elastic_nodes_id += 1
+                # write_hostfile(nodes, local_add_hostfile,
+                #                self.cores_per_node, shrink=True)
+                # run_command = f"prun --dvm-uri file:{dvm_uri} --add-hostfile {local_add_hostfile} -n {1} hostname &"
+                # proc = launch(run_command)
                 self.resources[jid]['status'] = JobStatus(
                     JobState.CANCELLED)  # Setting state to cancelled
                 logger.info("Killed Job: %s", jid)
