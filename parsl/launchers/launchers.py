@@ -533,6 +533,6 @@ class PMIxLauncher(Launcher):
         super().__init__(debug=debug)
 
     def __call__(self, command: str, nodes_per_block: int, dvm_uri: str, local_hostfile: str, worker_init_env: str) -> str:
-        command = "prun -x DVM_URI={0} --dvm-uri file:{0} --hostfile {1} --map-by node --bind-to none -n {2} {4}/bin/python {4}/bin/{3} &".format(
+        command = "/home/rbhattara/pmix_recent/install/prrte/bin/prun -x PYTHONPATH=/home/rbhattara/spack/opt/spack/linux-almalinux8-thunderx2/gcc-8.5.0/py-xtb-22.1-dktaggdgke2gmsbsnwdk6ztad4dptsog/lib/python3.11/site-packages -x DVM_URI={0} --dvm-uri file:{0} --hostfile {1} --map-by node --bind-to none -n {2} {4}/bin/python {4}/bin/{3} &".format(
             dvm_uri, local_hostfile, nodes_per_block, command, worker_init_env)
         return command

@@ -480,9 +480,10 @@ class Manager:
               Event to let the thread know when it is time to die.
         """
 
-        logger.debug("Starting worker watchdog")
+        logger.info("Starting worker watchdog")
 
         while not kill_event.wait(self.heartbeat_period):
+            worker_change_file = ""
             if os.environ.get('DVM_URI'):
                 dvm_path = os.environ['DVM_URI']
                 script_path = os.path.dirname(dvm_path)
@@ -491,6 +492,7 @@ class Manager:
                     with open(worker_change_file, 'r') as file:
                         content = file.readline().strip()  # Read the first line and remove extra spaces
                     change_worker_count, scale_type, local_add_hostfile = content.split(" ")
+                    logger.info("Set change Event")
                     change_event.set()
 
                     old_worker_count = self.worker_count
@@ -522,9 +524,11 @@ class Manager:
                         logger.info("Incorrect Scaling Type")
                     while change_event.is_set():
                         pass
-
+            
             current_procs = self.procs.copy()
             for worker_id, p in current_procs.items():
+                if os.path.exists(worker_change_file) and os.path.getsize(worker_change_file) > 0:
+                    break
                 if not p.is_alive():
                     logger.error("Worker {} has died".format(worker_id))
                     try:
@@ -853,6 +857,7 @@ def worker(
                     logger.info(cmd)
                     proc = subprocess.run(cmd, shell=True)
                     # clear change event
+                    time.sleep(2)
                     change_event.clear()
             else:
                 logger.info("Waiting for change event to finish from worker {}".format(worker_id))

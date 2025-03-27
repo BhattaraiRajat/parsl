@@ -16,6 +16,8 @@ from parsl.executors.status_handling import BlockProviderExecutor
 from parsl.jobs.states import JobState
 from parsl.process_loggers import wrap_with_logs
 
+from parsl.launchers import PMIxLauncher, SimplePMIxLauncher
+
 logger = logging.getLogger(__name__)
 
 

@@ -74,8 +74,8 @@ def start_dvm(local_hostfile, dvm_uri):
     # run DVM
     local_env = os.environ.copy()
     envs = copy.deepcopy(local_env)
-    cmd = "prte --pmixmca ptl_base_if_include ib0 --report-uri {0} --hostfile {1} --prtemca plm ^slurm --daemonize".format(
-        dvm_uri, local_hostfile)  # --pmixmca ptl_base_if_include ib0
+    cmd = "/home/rbhattara/pmix_recent/install/prrte/bin/prte --pmixmca ptl_base_if_include ib0 --report-uri {0} --hostfile {1} --prtemca plm ^slurm --daemonize".format(
+        dvm_uri, local_hostfile)
     logger.info(cmd)
     proc = subprocess.run(
         cmd,
@@ -107,7 +107,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
     @typeguard.typechecked
     def __init__(self,
                  nodes_per_block: int = 1,
-                 cores_per_node: Optional[int] = None,
+                 cores_per_node: Optional[int] = 64,
                  init_blocks: int = 1,
                  min_blocks: int = 0,
                  max_blocks: int = 1,
@@ -245,7 +245,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
                                 logger.info("Killing Gracefully %d Check.", pid)
                             except ProcessLookupError:
                                 print(f"No process with PID {pid} found.")
-                            run_command = f"prun --dvm-uri file:{dvm_uri} --add-hostfile {local_add_hostfile} -n {1} hostname &"
+                            run_command = f"/home/rbhattara/pmix_recent/install/prrte/bin/prun --dvm-uri file:{dvm_uri} --add-hostfile {local_add_hostfile} -n {1} hostname &"
                             proc = launch(run_command)
 
                             self.resources[job_id]['pid_and_nodes'] = [
