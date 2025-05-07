@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Sequence
 
 import psutil
 import zmq
+import fcntl
 
 from parsl import curvezmq
 from parsl.addresses import tcp_url
@@ -56,8 +57,12 @@ def read_and_remove_nodes_by_id(file_path, current_node):
     if current_node in nodes_list:
         nodes_list.remove(current_node)
         with open(file_path, 'w') as file:
-            for node in nodes_list:
-                file.write(f"{node}\n")
+            try:
+                fcntl.flock(file, fcntl.LOCK_EX)
+                for node in nodes_list:
+                    file.write(f"{node}\n")
+            finally:
+                fcntl.flock(file, fcntl.LOCK_UN)
         return True
     else:
         return False
@@ -841,8 +846,9 @@ def worker(
             if(worker_id == 0):
                 logger.info("Executing resource change in DVM")
                 # wait for dummy tasks to run alone
-                while(len(tasks_in_progress)!=0):
+                while(len(tasks_in_progress)!=0 or not result_queue.empty()):
                     pass
+                time.sleep(2) # wait 2s for result processing for safety
                 dvm_path = os.environ['DVM_URI']
                 script_path = os.path.dirname(dvm_path)
                 worker_change_file = f"{script_path}/worker_change_file"

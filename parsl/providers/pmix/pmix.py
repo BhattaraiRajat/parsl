@@ -111,6 +111,8 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
                  init_blocks: int = 1,
                  min_blocks: int = 0,
                  max_blocks: int = 1,
+                 min_nodes: int = 1,
+                 max_nodes: int = 1,
                  parallelism: float = 1,
                  job_id=-1,
                  node_list: str = '',
@@ -134,6 +136,8 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
         self.nodes = init_blocks * nodes_per_block
         self.node_list = node_list.split(",")
         self.cores_per_node = cores_per_node
+        self.min_nodes = min_nodes
+        self.max_nodes = max_nodes
         self.elastic_nodes_id = 0
         self.worker_init_env = worker_init_env
 
@@ -180,7 +184,8 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
         logger.info("Command prun %s", new_command)
 
         proc = launch(new_command)
-        logger.info("Allocated with jobid: %s", self.job_id)
+        logger.info("Allocated with jobid: %s and pid %s", self.job_id, proc.pid)
+        time.sleep(1)
 
         self.resources[self.job_id] = {'job_id': self.job_id, 'status': JobStatus(
             JobState.RUNNING), 'pid_and_nodes': [(proc.pid, self.node_list)]}

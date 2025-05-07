@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Sequence, TypedDict, Union, Tuple
 import json
 import os
 import fcntl
+import os
 
 from parsl.launchers import PMIxLauncher, SimplePMIxLauncher
 from parsl.executors import HighThroughputExecutor
@@ -101,6 +102,65 @@ def _get_elasticity_type_from_launcher(launcher) -> str:
     except Exception:
         pass
     return "unknown"
+
+def check_job_request_exists(file_path, job_id):
+    if os.path.exists(file_path):
+        with open(file_path, "r") as file:
+            job_requests_data = json.load(file)
+            if any(int(job_entry["job_id"]) == int(job_id) for job_entry in job_requests_data.get("job_requests", [])):
+                logger.info(f" Job Request {job_id} entry already exists.")
+                return True
+    return False
+
+def check_elasticity_active(file_path, worker_change_file, job_id):
+    if os.path.exists(file_path): # check if policy already exists 
+        with open(file_path, "r") as file:
+            policy_data = json.load(file)
+            if any(job_entry["id"] == str(job_id) for job_entry in policy_data["jobs"]):
+                logger.info(f"[Policy] Job {job_id} entry already exists.")
+                return True
+    if os.path.exists(worker_change_file) and os.path.getsize(worker_change_file) > 0: # check if worker ongoing changes
+        logger.info(f"Worker change from previous elastic event ongoing.")
+        return True
+
+    return False
+
+def update_job_requests_file(job_requests_file, scale, num_nodes, job_id):
+    new_entry = {
+        "job_id": str(job_id),
+        "scale": scale,
+        "num_nodes": num_nodes,
+        "status": "pending"
+    }
+    if not os.path.exists(job_requests_file) or os.stat(job_requests_file).st_size == 0:
+        logger.warning("Job requests file does not exist or is empty. Creating a new file.")
+        job_requests_data = {"job_requests": [new_entry]}
+        with open(job_requests_file, "w") as new_file:
+            json.dump(job_requests_data, new_file, indent=4)
+    else:
+        # Read and update the policy file
+        with open(job_requests_file, "r+") as file:
+            fcntl.flock(file, fcntl.LOCK_EX)
+            try:
+                job_requests_data = json.load(file)
+
+                if not any(job_entry["job_id"] == new_entry["job_id"] for job_entry in job_requests_data.get("job_requests", [])):
+                    job_requests_data["job_requests"].append(new_entry)
+                    file.seek(0)
+                    file.truncate()  # Clear the file before writing
+                    json.dump(job_requests_data, file, indent=4)
+                    logger.info(f"New job request entry added for Job {job_id}.")
+                else:
+                    logger.info(f"Job request {job_id} entry already exists.")
+
+            except json.JSONDecodeError:
+                logger.error("Invalid JSON format. Resetting job requests file.")
+                job_requests_data = {"job_requests": [new_entry]}
+                with open(job_requests_file, "w") as new_file:
+                    json.dump(job_requests_data, new_file, indent=4)
+
+            finally:
+                fcntl.flock(file, fcntl.LOCK_UN)
 
 
 class ExecutorState(TypedDict):
@@ -219,6 +279,11 @@ class Strategy:
         self.executors = {}
         self.max_idletime = max_idletime
         self.policy_file = policy_file
+        path_job_requests= os.path.dirname(policy_file)
+        self.job_requests_file =  f"{path_job_requests}/job_requests.json"
+
+        self.current_tasks_per_node = -1
+        self.current_nodes_per_block = -1
 
         self.strategies = {None: self._strategy_init_only,
                            'none': self._strategy_init_only,
@@ -280,6 +345,12 @@ class Strategy:
                 executor.scale_out_facade(executor.provider.init_blocks)
                 self.executors[label]['first'] = False
 
+            active_tasks = executor.outstanding
+            if self.current_nodes_per_block == -1:
+                self.current_nodes_per_block = executor.provider.nodes_per_block
+            if self.current_tasks_per_node == -1:
+                self.current_tasks_per_node = executor.workers_per_node
+
             job_id = executor.provider.job_id
             try:
                 if not self.policy_file or not os.path.exists(self.policy_file):
@@ -334,6 +405,80 @@ class Strategy:
                         logger.info("Unrecognized Elasticity Type: %r", etype)
             except Exception as e:
                 logger.error("Policy elasticity handling failed for job %s: %s", job_id, e)
+
+            # scaling logic start
+            if active_tasks == 0:
+                logger.info("Executor has no active tasks. Verifying inactivity before canceling.")
+                # We want to make sure that max_idletime is reached
+                # before killing off resources
+
+                if not self.executors[executor.label]['idle_since']:
+                    logger.debug(f"Starting idle timer for executor. If idle time exceeds {self.max_idletime}s, allocation will be canceled")
+                    self.executors[executor.label]['idle_since'] = time.time()
+                idle_since = self.executors[executor.label]['idle_since']
+                assert idle_since is not None, "The `if` statement above this assert should have forced idle time to be not-None"
+
+                idle_duration = time.time() - idle_since
+                if idle_duration > self.max_idletime:
+                    # We have resources idle for the max duration,
+                    # we have to cancel allocation now.
+                    logger.debug(f"Idle time has reached {self.max_idletime}s for executor {label}; scaling in")
+
+                    executor.provider.cancel([job_id])
+
+                else:
+                    logger.debug(
+                            f"Idle time {idle_duration}s is less than max_idletime {self.max_idletime}s"
+                            f" for executor {label}; not scaling in")
+
+            # scale by job requests (evolving workflow logic)
+            if check_job_request_exists(self.job_requests_file, job_id) or check_elasticity_active(self.policy_file, worker_change_file, job_id):
+                logger.info("Job Request already pending or elastic adjustment active.")
+            else:
+                if isinstance(executor.provider.launcher, PMIxLauncher):
+                    active_slots = self.current_tasks_per_node * self.current_nodes_per_block
+                else:
+                    active_slots = self.current_nodes_per_block
+
+                logger.info(f"Executor has active tasks of {active_tasks} and active slots of {active_slots}")
+
+                parallelism = executor.provider.parallelism
+                script_path = executor.provider.script_dir
+                worker_change_file = f"{script_path}/worker_change_file"
+
+                if (float(active_slots) / active_tasks) < parallelism:
+                    if isinstance(executor.provider.launcher, SimplePMIxLauncher):
+                        nodes_to_add = int(active_tasks - active_slots)
+                    else:
+                        nodes_to_add = int((active_tasks - active_slots) / self.current_tasks_per_node)
+                    
+                    if nodes_to_add > 0:
+                        logger.info("Trying Expansion Request")
+                        if self.current_nodes_per_block < executor.provider.max_nodes:
+                            if not check_job_request_exists(self.job_requests_file, job_id) and not check_elasticity_active(self.policy_file, worker_change_file, job_id):
+                                update_job_requests_file(self.job_requests_file, "expand", nodes_to_add, job_id)
+                            else:
+                                logger.info("Job Request already pending or elastic adjustment active.")
+                        else:
+                            logger.info(f"Job {job_id} already at full possible allocation. No Further Expansion.")
+
+                elif (float(active_slots) / active_tasks) > parallelism:
+                    if isinstance(executor.provider.launcher, SimplePMIxLauncher):
+                        nodes_to_remove = int(active_slots - active_tasks)
+                    else:
+                        nodes_to_remove = int((active_slots - active_tasks) / self.current_tasks_per_node)
+
+                    if nodes_to_remove > 0:
+                        logger.info("Trying Shrinkage Request")
+                        if self.current_nodes_per_block > executor.provider.min_nodes:
+                            if not check_job_request_exists(self.job_requests_file, job_id) and not check_elasticity_active(self.policy_file, worker_change_file, job_id):
+                                update_job_requests_file(self.job_requests_file, "shrink", nodes_to_remove, job_id)
+                            else:
+                                logger.info("Job Request already pending or elastic adjustment active.")
+                        else:
+                            logger.info(f"Job {job_id} already at minimum possible allocation. No Further Shrinking.")
+                else:
+                    pass
 
     @wrap_with_logs
     def _general_strategy(self, executors: List[BlockProviderExecutor], *, strategy_type: str) -> None:
