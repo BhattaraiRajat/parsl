@@ -4,9 +4,12 @@ import logging
 import math
 import time
 import warnings
-from typing import Dict, List, Optional, Sequence, TypedDict
+from typing import Dict, List, Optional, Sequence, TypedDict, Union, Tuple
 import json
+import os
+import fcntl
 
+from parsl.launchers import PMIxLauncher, SimplePMIxLauncher
 from parsl.executors import HighThroughputExecutor
 from parsl.executors.base import ParslExecutor
 from parsl.executors.status_handling import BlockProviderExecutor
@@ -16,26 +19,86 @@ from parsl.process_loggers import wrap_with_logs
 logger = logging.getLogger(__name__)
 
 
-def read_and_remove_job_by_id(file_path, job_id):
-    # Read the JSON data from the file
-    scale, elasticity_type, num_nodes, nodes, start_after = None, None, None, None, None
-    with open(file_path, 'r') as file:
-        data = json.load(file)
+def read_and_remove_job_by_id(file_path: str, job_id: Union[int, str]) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[list], Optional[Union[int, float]]]:
+    """Read a jobs JSON file, return fields for the given job_id, and remove that job entry.
 
-    for job in data["jobs"]:
-        if job["id"] == str(job_id):
-            scale, elasticity_type, num_nodes, nodes, start_after = job.get("scale"), job.get(
-                "elasticity_type"), job.get("num_nodes"), job.get("nodes"), job.get("start_after")
+    This is safe under concurrent access by using an exclusive file lock and
+    in-place rewrite (seek -> write -> truncate -> fsync).
 
-    # Modify the data by removing the entry with the specified id
-    data['jobs'] = [job for job in data['jobs']
-                    if int(job.get('id')) != job_id]
+    Returns (scale, num_nodes, nodes, start_after) or Nones if not found.
+    """
+    scale = None
+    num_nodes = None
+    nodes = None
+    start_after = None
 
-    # Write the updated data back to the file
-    with open(file_path, 'w') as file:
-        json.dump(data, file, indent=4)
+    target_id = str(job_id)
 
-    return scale, elasticity_type, num_nodes, nodes, start_after
+    try:
+        # Open read/write so we can update in-place under a single lock
+        with open(file_path, 'r+', encoding='utf-8') as f:
+            # Exclusive lock for read-modify-write
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                try:
+                    data = json.load(f)
+                except json.JSONDecodeError as e:
+                    logger.warning("Invalid JSON in %s: %s", file_path, e)
+                    data = {}
+
+                jobs = data.get("jobs")
+                if not isinstance(jobs, list):
+                    logger.warning("No 'jobs' list in %s; nothing to remove", file_path)
+                    # keep return values as None
+                    return scale, num_nodes, nodes, start_after
+
+                # Find the job and capture fields
+                found_idx = None
+                for idx, job in enumerate(jobs):
+                    jid = str(job.get("id"))
+                    if jid == target_id:
+                        found_idx = idx
+                        scale = job.get("scale")
+                        num_nodes = job.get("num_nodes")
+                        nodes = job.get("nodes")
+                        start_after = job.get("start_after")
+                        break
+
+                # Remove the job if present
+                if found_idx is not None:
+                    del jobs[found_idx]
+                    data["jobs"] = jobs
+                    # Rewrite file in-place
+                    f.seek(0)
+                    json.dump(data, f, indent=4)
+                    f.truncate()
+                    f.flush()
+                    os.fsync(f.fileno())
+                else:
+                    logger.info("Job id %s not found in %s; leaving file unchanged", target_id, file_path)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except FileNotFoundError:
+        logger.warning("Jobs file %s not found; nothing to remove", file_path)
+    except Exception as e:
+        logger.error("Error updating %s: %s", file_path, e)
+    logger.info("Read job id %s from %s: scale=%s num_nodes=%s nodes=%s start_after=%s", target_id, file_path, scale, num_nodes, nodes, start_after)
+    return scale, num_nodes, nodes, start_after
+
+def _get_elasticity_type_from_launcher(launcher) -> str:
+    """Return 'manager' for PMIxLauncher, 'worker' for SimplePMIxLauncher,
+    or try launcher.elasticity_type; otherwise 'unknown'."""
+    try:
+        if isinstance(launcher, PMIxLauncher):
+            return "manager"
+        if isinstance(launcher, SimplePMIxLauncher):
+            return "worker"
+        etype = getattr(launcher, "elasticity_type", None)
+        if isinstance(etype, str) and etype:
+            return etype.lower()
+    except Exception:
+        pass
+    return "unknown"
 
 
 class ExecutorState(TypedDict):
@@ -215,26 +278,60 @@ class Strategy:
                 executor.scale_out_facade(executor.provider.init_blocks)
                 self.executors[label]['first'] = False
 
-            # policy file induced elasticity
             job_id = executor.provider.job_id
-            scale, elasticity_type, num_nodes, nodes, start_after = read_and_remove_job_by_id(
-                self.policy_file, job_id)
-            if elasticity_type == "manager":
-                logger.info(f"Scaling Managers")
-                time.sleep(int(start_after))
-                if scale == "expand":
-                    executor.scale_out_pmix_facade(num_nodes, nodes)
-                elif scale == "shrink":
-                    executor.scale_in_pmix_facade(num_nodes, nodes)
+            try:
+                if not self.policy_file or not os.path.exists(self.policy_file):
+                    logger.info("No policy file configured or found; skipping elasticity for job %s", job_id)
                 else:
-                    logger.debug(f"Error config")
-            elif elasticity_type == "worker":
-                logger.info(f"Scaling Workers")
-                time.sleep(int(start_after))
-                executor.scale_worker_pmix_facade(scale, num_nodes, nodes)
-            else:
-                logger.info(
-                    f"Error Elasticity Type:  {elasticity_type}")
+                    scale, num_nodes, nodes, start_after = read_and_remove_job_by_id(self.policy_file, job_id)
+                    scale_str = str(scale).lower() if scale is not None else None
+                    num_nodes = int(num_nodes) if num_nodes is not None else None
+                    etype = _get_elasticity_type_from_launcher(executor.provider.launcher)
+                    logger.info("Policy elasticity for job %s: type=%s scale=%s num_nodes=%s nodes=%s start_after=%s", job_id, etype, scale, num_nodes, nodes, start_after)
+                    if not scale_str:
+                        logger.info("No scale directive found for job %s; skipping", job_id)
+                        continue
+                    # normalize start_after delay
+                    delay = 0.0
+                    try:
+                        if start_after is not None:
+                            delay = max(0.0, float(start_after))
+                    except Exception:
+                        delay = 0.0
+                    if delay:
+                        time.sleep(delay)
+
+                    if etype == "manager":
+                        if scale_str == "expand":
+                            if num_nodes and num_nodes > 0:
+                                try:
+                                    logger.info("Manager expand by %d nodes (nodes=%r) for job %s", num_nodes, nodes, job_id) 
+                                    executor.scale_out_pmix_facade(num_nodes, nodes)
+                                except Exception as e:
+                                    logger.warning("Manager expand failed for job %s: %s", job_id, e)
+                            else:
+                                logger.info("Invalid num_nodes for manager expand: %r", num_nodes)
+                        elif scale_str == "shrink":
+                            if num_nodes and num_nodes > 0:
+                                try:
+                                    logger.info("Manager shrink by %d nodes (nodes=%r) for job %s", num_nodes, nodes, job_id)  
+                                    executor.scale_in_pmix_facade(num_nodes, nodes)
+                                except Exception as e:
+                                    logger.warning("Manager shrink failed for job %s: %s", job_id, e)
+                            else:
+                                logger.info("Invalid num_nodes for manager shrink: %r", num_nodes)
+                        else:
+                            logger.debug("Unknown manager scale directive: %r", scale)
+                    elif etype == "worker":
+                        try:
+                            logger.info("Worker scale %s by %r nodes (nodes=%r) for job %s", scale_str, num_nodes, nodes, job_id)
+                            executor.scale_worker_pmix_facade(scale_str, num_nodes, nodes)
+                        except Exception as e:
+                            logger.warning("Worker scale %s failed for job %s: %s", scale_str, job_id, e)
+                    else:
+                        logger.info("Unrecognized Elasticity Type: %r", etype)
+            except Exception as e:
+                logger.error("Policy elasticity handling failed for job %s: %s", job_id, e)
 
     @wrap_with_logs
     def _general_strategy(self, executors: List[BlockProviderExecutor], *, strategy_type: str) -> None:

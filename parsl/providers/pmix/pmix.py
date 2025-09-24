@@ -10,24 +10,21 @@ from typing import Optional
 
 from parsl.launchers.base import Launcher
 from parsl.jobs.states import JobState, JobStatus
-from parsl.utils import wtime_to_minutes, RepresentationMixin
+from parsl.utils import RepresentationMixin
 from parsl.providers.cluster_provider import ClusterProvider
 
-from parsl.launchers import PMIxLauncher, SimplePMIxLauncher
+from parsl.launchers import PMIxLauncher
 
 logger = logging.getLogger(__name__)
 
 
-def write_hostfile(nodes, hostfile_path, slots, shrink=False, launcher=PMIxLauncher()):
+def write_hostfile(nodes, hostfile_path, slots, shrink=False):
     """Write node identifiers back to the hostfile."""
     with open(hostfile_path, 'w') as file:
         if shrink:
             file.writelines(
                 f"{node.strip()} slots=-{slots} \n" for node in nodes)
         else:
-            # if isinstance(launcher, SimplePMIxLauncher):
-            #     file.writelines(f"{node.strip()} slots={slots + 1 if i == 0 else slots}\n" for i, node in enumerate(nodes))
-            # else:
             file.writelines(
                 f"{node.strip()} slots={slots} \n" for node in nodes)
 
@@ -38,9 +35,39 @@ def launch(run_command):
         run_command,
         env=envs,
         close_fds=True,
-        shell=True
+        shell=True,
+        start_new_session=True  # creates a new pgid == proc.pid
     )
     return proc
+
+
+def _terminate_pgid(pgid: int, grace_seconds: float = 3.0) -> bool:
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True  # already gone
+    except Exception as e:
+        logger.warning("Failed to send SIGTERM to pgid %s: %s", pgid, e)
+
+    deadline = time.time() + grace_seconds
+    while time.time() < deadline:
+        try:
+            # sending signal 0 checks if any process in the group still exists
+            os.killpg(pgid, 0)
+            time.sleep(0.1)
+        except ProcessLookupError:
+            return True  # group exited
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except Exception as e:
+        logger.error("Failed to send SIGKILL to pgid %s: %s", pgid, e)
+        return False
+
+    time.sleep(0.1)
+    return True
 
 
 def start_dvm(local_hostfile, dvm_uri):
@@ -63,7 +90,7 @@ def stop_dvm(dvm_uri):
     # stop DVM
     local_env = os.environ.copy()
     envs = copy.deepcopy(local_env)
-    cmd = "pterm --report-uri file:{0}".format(dvm_uri)
+    cmd = "pterm --dvm-uri file:{0}".format(dvm_uri)
     logger.info(cmd)
     proc = subprocess.run(
         cmd,
@@ -71,7 +98,7 @@ def stop_dvm(dvm_uri):
         capture_output=True,
         shell=True
     )
-    logger.info("PRRTE DVM Terminated")
+    logger.info(f"PRRTE DVM Terminated: {cmd} {proc.stdout} {proc.stderr}")
 
 
 class PMIxProvider(ClusterProvider, RepresentationMixin):
@@ -121,7 +148,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
         '''
         return
 
-    def submit(self, command, tasks_per_node: int, job_name: str = "parsl.pmix"):
+    def submit(self, command, tasks_per_node: int = 1, job_name: str = "parsl.pmix"):
         """Submit the command as a pmix job.
 
         Parameters
@@ -144,7 +171,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
         local_hostfile = "{0}/hostfile".format(script_path)
         dvm_uri = "{0}/dvm.uri".format(script_path)
 
-        write_hostfile(self.node_list, local_hostfile, self.cores_per_node, False, self.launcher)
+        write_hostfile(self.node_list, local_hostfile, self.cores_per_node, False)
 
         start_dvm(local_hostfile, dvm_uri)
 
@@ -186,20 +213,22 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
 
                 if scale == "expand":
                     write_hostfile([node], local_add_hostfile, self.cores_per_node)
-                    run_command = f"prun --dvm-uri file:{dvm_uri} --add-hostfile {local_add_hostfile} --hostfile {local_add_hostfile} --map-by node --bind-to none -n 1 {self.worker_init_env}/bin/python {self.worker_init_env}/bin/{command} &"
+                    run_command = (
+                        f"prun --dvm-uri file:{dvm_uri} "
+                        f"--add-hostfile {local_add_hostfile} "
+                        f"--hostfile {local_add_hostfile} "
+                        f"--map-by node --bind-to none -n 1 "
+                        f"{self.worker_init_env}/bin/python {self.worker_init_env}/bin/{command} &"
+                    )
                     proc = launch(run_command)
                     # fix parallel runs bug on dvm change
                     time.sleep(1)
-                    logger.info(
-                        "Allocated with node: %s on job id: %s", node, job_id)
-                    print(
-                        f"Finished expansion of jobid: {job_id} with node {node}")
-                    self.resources[job_id]['pid_and_nodes'].append(
-                        (proc.pid, [node.strip()]))
+                    logger.info("Allocated with node: %s on job id: %s", node, job_id)
+                    print(f"Finished expansion of jobid: {job_id} with node {node}")
+                    self.resources[job_id]['pid_and_nodes'].append((proc.pid, [node.strip()]))
                 elif scale == "shrink":
                     node_to_kill_file_path = f"{script_path}/node_to_kill_file"
-                    write_hostfile([node], local_add_hostfile,
-                                self.cores_per_node, shrink=True)
+                    write_hostfile([node], local_add_hostfile, self.cores_per_node, shrink=True)
 
                     pid_and_nodes = self.resources[job_id]['pid_and_nodes']
 
@@ -253,41 +282,58 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
         [True/False...] : If the cancel operation fails the entire list will be False.
         '''
 
-        script_path = self.script_dir
-        script_path = os.path.abspath(script_path)
-        dvm_uri = "{0}/dvm.uri".format(script_path)
+        script_path = os.path.abspath(self.script_dir)
+        dvm_uri = f"{script_path}/dvm.uri"
+
+        results = []
 
         for jid in job_ids:
-            pid_and_nodes = self.resources[jid]['pid_and_nodes']
-            for pid_and_node in pid_and_nodes:
-                # add 1 to the pid, this is the actual prun id
-                pid = int(pid_and_node[0]) + 1
-                nodes = pid_and_node[1]
+            ok = True
+            res = self.resources.get(jid)
+            if not res:
+                logger.warning("Cancel called for unknown job id: %s", jid)
+                results.append(False)
+                continue
 
-                # Terminate the process
+            pid_and_nodes = res.get('pid_and_nodes', [])
+            for pid in pid_and_nodes:
                 try:
-                    # Try to terminate the process gracefully
-                    os.kill(pid, signal.SIGTERM)
-                    logger.info("Killing Gracefully %d Check.", pid)
+                    pgid = os.getpgid(pid)
                 except ProcessLookupError:
-                    print(f"No process with PID {pid} found.")
+                    logger.info("Process %s already exited (jid %s)", pid, jid)
+                    continue
+                except Exception as e:
+                    logger.warning("Could not get pgid for pid %s (jid %s): %s", pid, jid, e)
+                    # Best-effort: try both TERM and KILL on the pid
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        time.sleep(0.2)
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except Exception as ee:
+                        logger.error("Killing pid %s failed: %s", pid, ee)
+                        ok = False
+                    continue
 
-                logger.info("%d killed successfully.", pid)
+                if not _terminate_pgid(pgid):
+                    logger.error("Failed to terminate process group %s for jid %s", pgid, jid)
+                    ok = False
 
-                local_add_hostfile = "{0}/add_hostfile{1}".format(
-                    script_path, self.elastic_nodes_id)
-                self.elastic_nodes_id += 1
-                write_hostfile(nodes, local_add_hostfile,
-                               self.cores_per_node, shrink=True)
-                run_command = f"prun --dvm-uri file:{dvm_uri} --add-hostfile {local_add_hostfile} -n {1} hostname &"
-                proc = launch(run_command)
-                self.resources[jid]['status'] = JobStatus(
-                    JobState.CANCELLED)  # Setting state to cancelled
+            if ok:
+                self.resources[jid]['status'] = JobStatus(JobState.CANCELLED)
                 logger.info("Killed Job: %s", jid)
+            else:
+                logger.warning("Job %s may not have been fully terminated", jid)
 
-        rets = [True for i in job_ids]
-        stop_dvm(dvm_uri)
-        return rets
+            results.append(ok)
+
+        try:
+            stop_dvm(dvm_uri)
+        except Exception as e:
+            logger.warning("Failed to stop DVM: %s", e)
+
+        return results
 
     @property
     def status_polling_interval(self):
