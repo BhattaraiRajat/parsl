@@ -118,6 +118,7 @@ class Config(RepresentationMixin, UsageInformation):
                  std_autopath: Optional[Callable] = None,
                  strategy: Optional[str] = 'simple',
                  strategy_policy_file: Optional[str] = '',
+                 strategy_evolving_requests_file: Optional[str] = '',
                  strategy_period: Union[float, int] = 5,
                  max_idletime: float = 120.0,
                  monitoring: Optional[MonitoringHub] = None,
@@ -157,6 +158,7 @@ class Config(RepresentationMixin, UsageInformation):
         self.strategy = strategy
         self.strategy_period = strategy_period
         self.strategy_policy_file = strategy_policy_file
+        self.strategy_evolving_requests_file = strategy_evolving_requests_file
         self.max_idletime = max_idletime
         self.validate_usage_tracking(usage_tracking)
         self.usage_tracking = usage_tracking

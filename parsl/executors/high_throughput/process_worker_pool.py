@@ -48,40 +48,108 @@ DRAINED_CODE = (2 ** 32) - 2
 
 kill_event_global = False
 
-def read_and_remove_nodes_by_id(file_path, current_node):
-    with open(file_path, 'r') as file:
-        nodes = file.readlines()
-    # Strip newline characters from each ID
-    nodes_list = [node.strip() for node in nodes]
+def _normalize_hostname(name: str) -> str:
+    """Normalize hostname by taking the short name and lowercasing."""
+    try:
+        return name.strip().lower().split('.')[0]
+    except Exception:
+        return name.strip().lower()
 
-    if current_node in nodes_list:
-        nodes_list.remove(current_node)
-        with open(file_path, 'w') as file:
+def read_nodes_from_file(file_path: str, target_node: str) -> bool:
+    """Check if target_node exists in the file (newline-separated nodes).
+    
+    Args:
+        file_path: Path to the file containing node names
+        target_node: Node name to search for
+    
+    Returns:
+        True if target node found, False otherwise
+    """
+    try:
+        target_short = _normalize_hostname(target_node)
+        
+        with open(file_path, 'r', encoding='utf-8') as file:
+            for line in file:
+                node = line.strip()
+                if node and _normalize_hostname(node) == target_short:
+                    return True
+        return False
+            
+    except FileNotFoundError:
+        logger.debug("Node file %s not found", file_path)
+        return False
+    except Exception as e:
+        logger.warning("Failed to read node file %s: %s", file_path, e)
+        return False
+
+def remove_node_from_file(file_path: str, target_node: str) -> bool:
+    """Remove target_node from file atomically with file locking.
+    
+    Returns True if the node was found and removed; False otherwise.
+    """
+    try:
+        with open(file_path, 'r+', encoding='utf-8') as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
             try:
-                fcntl.flock(file, fcntl.LOCK_EX)
-                for node in nodes_list:
-                    file.write(f"{node}\n")
+                # Read and normalize entries
+                f.seek(0)
+                lines = f.read().splitlines()
+                nodes_list = [ln.strip() for ln in lines if ln.strip()]
+
+                # Remove any entries matching target_node (short or FQDN)
+                target_short = _normalize_hostname(target_node)
+                new_nodes = []
+                removed = False
+                for n in nodes_list:
+                    n_short = _normalize_hostname(n)
+                    if n_short == target_short:
+                        removed = True
+                        continue
+                    new_nodes.append(n)
+
+                if removed:
+                    # Rewrite atomically in-place
+                    f.seek(0)
+                    if new_nodes:
+                        f.write("\n".join(new_nodes))
+                        f.write("\n")
+                    else:
+                        # Empty the file if no nodes left
+                        pass
+                    f.truncate()
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                return removed
             finally:
-                fcntl.flock(file, fcntl.LOCK_UN)
-        return True
-    else:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except FileNotFoundError:
+        logger.debug("Node file %s not found during removal", file_path)
+        return False
+    except Exception as e:
+        logger.warning("Failed to update node file %s: %s", file_path, e)
         return False
 
 def signal_handler(logdir, sig, frame):
+    """SIGURG handler: if this node is in kill file, mark for graceful shutdown but don't remove yet."""
     global kill_event_global
-    log_dir_parent_dir = logdir[:logdir.rfind('/')]
-    script_path = f"{log_dir_parent_dir}/submit_scripts"
-    node_to_kill_file_path = f"{script_path}/node_to_kill_file"
+    try:
+        log_dir_parent_dir = logdir[:logdir.rfind('/')]
+        script_path = f"{log_dir_parent_dir}/submit_scripts"
+        node_to_kill_file_path = f"{script_path}/node_to_kill_file"
 
-    if os.path.exists(node_to_kill_file_path) and os.path.getsize(node_to_kill_file_path) > 0:
-        current_node = platform.node()
-        to_kill = read_and_remove_nodes_by_id(node_to_kill_file_path, current_node)
-        if to_kill:
-            kill_event_global = True
-        else:
-            kill_event_global = False
-    else:
-        pass
+        if os.path.exists(node_to_kill_file_path) and os.path.getsize(node_to_kill_file_path) > 0:
+            current_node = platform.node()
+            to_kill = read_nodes_from_file(node_to_kill_file_path, current_node)
+            if to_kill:
+                logger.info(f"SIGURG: Node {current_node} found in kill file, marking for graceful shutdown")
+                kill_event_global = True
+            else:
+                logger.info(f"SIGURG: Node {current_node} not found in kill file")
+                kill_event_global = False
+    except Exception as e:
+        # Never raise from signal handler
+        logger.error(f"Error in SIGURG handler: {e}")
 
 
 class Manager:
@@ -575,13 +643,16 @@ class Manager:
         while not kill_event.is_set():
             global kill_event_global
             try:
-                if kill_event_global == True:
-                    logger.info(
-                        "Start killing manager. Waiting for pending tasks to be 0")
-                    # logger.info(f"Values are {self.pending_task_queue.qsize()} {self.ready_worker_count.value} {self.worker_count} {self.pending_result_queue.qsize()} {len(self._tasks_in_progress)}")
-                    while len(self._tasks_in_progress) != 0:
-                        pass
-                    logger.info(f"Setting kill event")
+                if kill_event_global:
+                    logger.info("Starting graceful shutdown sequence. Waiting for pending tasks to complete.")
+                    
+                    # Wait for in-progress tasks to finish
+                    while len(self._tasks_in_progress) > 0:
+                        logger.info(f"Waiting for {len(self._tasks_in_progress)} tasks to complete")
+                        time.sleep(1)  # Check periodically rather than busy-wait
+                    
+                    # Finally set the kill event to exit
+                    logger.info("Setting kill event to terminate manager")
                     kill_event.set()
                     break
 
@@ -654,6 +725,23 @@ class Manager:
         self.zmq_context.term()
         delta = time.time() - self._start_time
         logger.info("process_worker_pool ran for {} seconds".format(delta))
+        # On receiving the kill event, check if this node is in the kill file. If yes, remove it.
+        if os.environ.get('DVM_URI'):
+            dvm_path = os.environ['DVM_URI']
+            script_path = os.path.dirname(dvm_path)
+            kill_file = f"{script_path}/node_to_kill_file"
+            
+            logger.info(f"Looking for kill file at: {kill_file}")
+            current_node = platform.node()
+            if os.path.exists(kill_file) and os.path.getsize(kill_file) > 0 and read_nodes_from_file(kill_file, current_node):
+                logger.info(f"Found kill file. Removing node {current_node}")
+                removed = remove_node_from_file(kill_file, current_node)
+                logger.info(f"Node {current_node} removed from kill file: {removed}")
+            else:
+                logger.warning(f"Kill file not found at {kill_file}")
+        else:
+            logger.warning("DVM_URI environment variable not set; cannot determine kill file location")
+
         return
 
     def _start_worker(self, worker_id: int):
@@ -856,14 +944,14 @@ def worker(
                     with open(worker_change_file, 'r') as file:
                         content = file.readline().strip()  # Read the first line and remove extra spaces
                     change_worker_count, scale_type, local_add_hostfile = content.split(" ")
-                    with open(worker_change_file, 'w') as file:
-                        file.truncate()  # Empty the file content
-                    cmd =  "~/pmix_recent/install/prrte/bin/prun --dvm-uri file:{0} --add-hostfile {1} -np 2 hostname".format(dvm_path, local_add_hostfile)
+                    cmd =  "prun --dvm-uri file:{0} --add-hostfile {1} -np 2 hostname".format(dvm_path, local_add_hostfile)
                     # run dummy tasks
                     logger.info(cmd)
                     proc = subprocess.run(cmd, shell=True)
                     # clear change event
                     time.sleep(2)
+                    with open(worker_change_file, 'w') as file:
+                        file.truncate()  # Empty the file content
                     change_event.clear()
             else:
                 logger.info("Waiting for change event to finish from worker {}".format(worker_id))

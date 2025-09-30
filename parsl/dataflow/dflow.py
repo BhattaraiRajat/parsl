@@ -178,6 +178,7 @@ class DataFlowKernel:
         self.job_status_poller = JobStatusPoller(strategy=self.config.strategy,
                                                  strategy_period=self.config.strategy_period,
                                                  policy_file=self.config.strategy_policy_file,
+                                                 evolving_requests_file=self.config.strategy_evolving_requests_file,
                                                  max_idletime=self.config.max_idletime)
 
         self.executors: Dict[str, ParslExecutor] = {}
