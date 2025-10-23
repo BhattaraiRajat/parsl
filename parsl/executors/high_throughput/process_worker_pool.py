@@ -586,7 +586,7 @@ class Manager:
                         while (worker_change_count > 0):
                             worker_id = worker_id - 1
                             while worker_id in self._tasks_in_progress.keys():
-                                pass
+                                time.sleep(1)
                             self.procs[worker_id].terminate()
                             self.procs[worker_id].join()
                             logger.info("Worker {} joined successfully".format(
@@ -596,7 +596,7 @@ class Manager:
                     else:
                         logger.info("Incorrect Scaling Type")
                     while change_event.is_set():
-                        pass
+                        time.sleep(1)
             
             current_procs = self.procs.copy()
             for worker_id, p in current_procs.items():
@@ -924,18 +924,14 @@ def worker(
 
     worker_enqueued = False
 
+    task_queue_short_timeout = 4
     while manager_is_alive():
-        if not worker_enqueued:
-            with ready_worker_count.get_lock():
-                ready_worker_count.value += 1
-            worker_enqueued = True
-
         if change_event.is_set():
             if(worker_id == 0):
                 logger.info("Executing resource change in DVM")
                 # wait for dummy tasks to run alone
                 while(len(tasks_in_progress)!=0 or not result_queue.empty()):
-                    pass
+                    time.sleep(1)
                 time.sleep(2) # wait 2s for result processing for safety
                 dvm_path = os.environ['DVM_URI']
                 script_path = os.path.dirname(dvm_path)
@@ -956,11 +952,17 @@ def worker(
             else:
                 logger.info("Waiting for change event to finish from worker {}".format(worker_id))
                 while (change_event.is_set()):
-                    pass
+                    time.sleep(1)
+                logger.info("Change event finished, resuming normal operation for worker {}".format(worker_id))
+
+        if not worker_enqueued:
+            with ready_worker_count.get_lock():
+                ready_worker_count.value += 1
+            worker_enqueued = True
 
         try:
             # The worker will receive {'task_id':<tid>, 'buffer':<buf>}
-            req = task_queue.get(timeout=task_queue_timeout)
+            req = task_queue.get(timeout=task_queue_short_timeout)
         except queue.Empty:
             continue
 
