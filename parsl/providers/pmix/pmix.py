@@ -174,6 +174,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
                  node_list: str = '',
                  walltime: str = "00:10:00",
                  worker_init_env: str = '',
+                 preemptive: bool = False,
                  cmd_timeout: int = 10,
                  launcher: Launcher = PMIxLauncher(),):
 
@@ -196,6 +197,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
         self.max_nodes = max_nodes
         self.elastic_nodes_id = 0
         self.worker_init_env = worker_init_env
+        self.preemptive = preemptive
 
     def _status(self):
         '''Returns the status list for a list of job_ids
@@ -236,9 +238,9 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
         start_dvm(local_hostfile, dvm_uri)
 
         new_command = self.launcher(
-            command, self.nodes_per_block, dvm_uri, local_hostfile, self.worker_init_env)
+            command, self.nodes_per_block, dvm_uri, local_hostfile, self.worker_init_env, self.preemptive)
         logger.info("Command prun %s", new_command)
-
+ 
         proc = launch(new_command)
         time.sleep(1)
         logger.info("Allocated with jobid: %s and pid %s", self.job_id, proc.pid)
@@ -389,15 +391,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
             logger.info(f"Finished {scale} of jobid: {job_id} with nodes {nodes}")
 
     def cancel(self, job_ids):
-        ''' Cancels the jobs specified by a list of job ids
-
-        Args:
-        job_ids : [<job_id> ...]
-
-        Returns :
-        [True/False...] : If the cancel operation fails the entire list will be False.
-        '''
-
+        """Cancels the jobs specified by a list of job ids"""
         script_path = os.path.abspath(self.script_dir)
         dvm_uri = f"{script_path}/dvm.uri"
 
@@ -412,7 +406,13 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
                 continue
 
             pid_and_nodes = res.get('pid_and_nodes', [])
-            for pid in pid_and_nodes:
+            for pid_and_nodes_entry in pid_and_nodes:
+                # Extract PID from tuple (pid, nodes_list)
+                if isinstance(pid_and_nodes_entry, tuple):
+                    pid = pid_and_nodes_entry[0]
+                else:
+                    pid = pid_and_nodes_entry
+                    
                 try:
                     pgid = os.getpgid(pid)
                 except ProcessLookupError:
@@ -420,7 +420,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
                     continue
                 except Exception as e:
                     logger.warning("Could not get pgid for pid %s (jid %s): %s", pid, jid, e)
-                    # Best-effort: try both TERM and KILL on the pid
+                    # Best-effort fallback
                     try:
                         os.kill(pid, signal.SIGTERM)
                         time.sleep(0.2)

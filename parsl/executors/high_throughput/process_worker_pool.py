@@ -559,6 +559,7 @@ class Manager:
             worker_change_file = ""
             if os.environ.get('DVM_URI'):
                 dvm_path = os.environ['DVM_URI']
+                preemptive = os.environ.get('PREEMPTIVE', 'True') == 'True'
                 script_path = os.path.dirname(dvm_path)
                 worker_change_file = f"{script_path}/worker_change_file"
                 if os.path.exists(worker_change_file) and os.path.getsize(worker_change_file) > 0:
@@ -585,19 +586,37 @@ class Manager:
                         worker_id = old_worker_count
                         while (worker_change_count > 0):
                             worker_id = worker_id - 1
-                            while worker_id in self._tasks_in_progress.keys():
-                                time.sleep(1)
+                            if preemptive:
+                                try:
+                                    task = self._tasks_in_progress.pop(worker_id)
+                                    logger.info("Worker {} was busy when it was preemptively killed".format(worker_id))
+                                    try:
+                                        raise WorkerLost(worker_id, platform.node())
+                                    except Exception:
+                                        logger.info("Putting exception for executor task {} in the pending result queue".format(task['task_id']))
+                                        result_package = {'type': 'result',
+                                                        'task_id': task['task_id'],
+                                                        'exception': serialize(RemoteExceptionWrapper(*sys.exc_info()))}
+                                        pkl_package = pickle.dumps(result_package)
+                                        self.pending_result_queue.put(pkl_package)
+                                except KeyError:
+                                    logger.info("Worker {} was not busy when it was preemptively killed".format(worker_id))
+                            else:
+                                logger.info("Waiting for worker {} to be free".format(worker_id))
+                                while worker_id in self._tasks_in_progress.keys():
+                                    pass
+                                    # time.sleep(2)
                             self.procs[worker_id].terminate()
                             self.procs[worker_id].join()
-                            logger.info("Worker {} joined successfully".format(
-                                self.procs[worker_id]))
+                            logger.info("Worker {} joined successfully".format(self.procs[worker_id]))
                             self.procs.pop(worker_id)
                             worker_change_count = worker_change_count-1
                     else:
                         logger.info("Incorrect Scaling Type")
                     while change_event.is_set():
-                        time.sleep(1)
-            
+                        pass
+                        # time.sleep(2)
+
             current_procs = self.procs.copy()
             for worker_id, p in current_procs.items():
                 if os.path.exists(worker_change_file) and os.path.getsize(worker_change_file) > 0:
@@ -645,12 +664,13 @@ class Manager:
             try:
                 if kill_event_global:
                     logger.info("Starting graceful shutdown sequence. Waiting for pending tasks to complete.")
-                    
-                    # Wait for in-progress tasks to finish
-                    while len(self._tasks_in_progress) > 0:
-                        logger.info(f"Waiting for {len(self._tasks_in_progress)} tasks to complete")
-                        time.sleep(1)  # Check periodically rather than busy-wait
-                    
+                    preemptive = os.environ.get('PREEMPTIVE', 'True') == 'True'
+                    if not preemptive:
+                        # Wait for in-progress tasks to finish
+                        while len(self._tasks_in_progress) > 0:
+                            logger.info(f"Waiting for {len(self._tasks_in_progress)} tasks to complete")
+                            # time.sleep(2)  # Check periodically rather than busy-wait
+                            pass
                     # Finally set the kill event to exit
                     logger.info("Setting kill event to terminate manager")
                     kill_event.set()
@@ -924,14 +944,14 @@ def worker(
 
     worker_enqueued = False
 
-    task_queue_short_timeout = 4
     while manager_is_alive():
         if change_event.is_set():
             if(worker_id == 0):
                 logger.info("Executing resource change in DVM")
                 # wait for dummy tasks to run alone
                 while(len(tasks_in_progress)!=0 or not result_queue.empty()):
-                    time.sleep(1)
+                    # time.sleep(2)
+                    pass
                 time.sleep(2) # wait 2s for result processing for safety
                 dvm_path = os.environ['DVM_URI']
                 script_path = os.path.dirname(dvm_path)
@@ -952,7 +972,8 @@ def worker(
             else:
                 logger.info("Waiting for change event to finish from worker {}".format(worker_id))
                 while (change_event.is_set()):
-                    time.sleep(1)
+                    pass
+                    # time.sleep(2)
                 logger.info("Change event finished, resuming normal operation for worker {}".format(worker_id))
 
         if not worker_enqueued:
@@ -962,7 +983,7 @@ def worker(
 
         try:
             # The worker will receive {'task_id':<tid>, 'buffer':<buf>}
-            req = task_queue.get(timeout=task_queue_short_timeout)
+            req = task_queue.get(timeout=task_queue_timeout)
         except queue.Empty:
             continue
 
