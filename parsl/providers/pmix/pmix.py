@@ -130,7 +130,7 @@ def start_dvm(local_hostfile, dvm_uri):
     # run DVM
     local_env = os.environ.copy()
     envs = copy.deepcopy(local_env)
-    cmd = "/home/rbhattara/pmix_recent/install/prrte/bin/prte --pmixmca ptl_base_if_include ib0 --report-uri {0} --hostfile {1} --prtemca plm ^slurm --daemonize".format(
+    cmd = "prte --pmixmca ptl_base_if_include ib0 --report-uri {0} --hostfile {1} --prtemca plm ^slurm --daemonize".format(
         dvm_uri, local_hostfile)
     logger.info(cmd)
     proc = subprocess.run(
