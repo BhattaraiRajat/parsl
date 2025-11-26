@@ -126,12 +126,12 @@ def _terminate_pgid(pgid: int, grace_seconds: float = 3.0) -> bool:
     return True
 
 
-def start_dvm(local_hostfile, dvm_uri):
+def start_dvm(local_hostfile, dvm_uri, interface):
     # run DVM
     local_env = os.environ.copy()
     envs = copy.deepcopy(local_env)
-    cmd = "prte --pmixmca ptl_base_if_include ib0 --report-uri {0} --hostfile {1} --prtemca plm ^slurm --daemonize".format(
-        dvm_uri, local_hostfile)
+    cmd = "prte --pmixmca ptl_base_if_include {2} --report-uri {0} --hostfile {1} --prtemca plm ^slurm --daemonize".format(
+        dvm_uri, local_hostfile, interface)
     logger.info(cmd)
     proc = subprocess.run(
         cmd,
@@ -176,6 +176,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
                  worker_init_env: str = '',
                  preemptive: bool = False,
                  cmd_timeout: int = 10,
+                 interface: str = 'ib0',
                  launcher: Launcher = PMIxLauncher(),):
 
         label = 'pmix'
@@ -198,6 +199,8 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
         self.elastic_nodes_id = 0
         self.worker_init_env = worker_init_env
         self.preemptive = preemptive
+        self.interface = interface
+        self.resources = dict()
 
     def _status(self):
         '''Returns the status list for a list of job_ids
@@ -235,7 +238,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
 
         write_hostfile(self.node_list, local_hostfile, self.cores_per_node)
 
-        start_dvm(local_hostfile, dvm_uri)
+        start_dvm(local_hostfile, dvm_uri, self.interface)
 
         new_command = self.launcher(
             command, self.nodes_per_block, dvm_uri, local_hostfile, self.worker_init_env, self.preemptive)
