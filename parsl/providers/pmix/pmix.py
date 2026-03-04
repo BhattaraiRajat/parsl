@@ -283,7 +283,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
 
                 write_hostfile([node], local_add_hostfile, self.cores_per_node, scale="expand")
                 run_command = (
-                    f"prun -x DVM_URI={dvm_uri} --dvm-uri file:{dvm_uri} "
+                    f"prun -x PYTHONPATH=/home/rbhattara/spack/opt/spack/linux-almalinux8-thunderx2/gcc-8.5.0/py-xtb-22.1-dktaggdgke2gmsbsnwdk6ztad4dptsog/lib/python3.11/site-packages -x DVM_URI={dvm_uri} -x PREEMPTIVE={self.preemptive} --dvm-uri file:{dvm_uri} "
                     f"--add-hostfile {local_add_hostfile} "
                     f"--host {node}:{self.cores_per_node} "
                     f"--map-by node --bind-to none -n 1 " 
@@ -292,7 +292,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
                 proc = launch(run_command)
                 logger.info("Launched expansion command: %s", run_command)
                 # fix parallel runs bug on dvm change
-                time.sleep(1)
+                time.sleep(2)
                 if not verify_process_running(proc.pid, timeout=5):
                     logger.error(f"Process {proc.pid} failed to start or died quickly")
                     raise RuntimeError(f"Failed to start process for job {self.job_id}")
@@ -301,6 +301,7 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
                 logger.info("Allocated with node: %s on job id: %s", node, job_id)
                 logger.info(f"Finished expansion of jobid: {job_id} with node {node}")
                 self.resources[job_id]['pid_and_nodes'].append((proc.pid, [node.strip()]))
+            time.sleep(4)
 
         if elasticity_type == "manager" and scale == "shrink":
             node_to_kill_file_path = f"{script_path}/node_to_kill_file"
@@ -310,28 +311,27 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
             write_hostfile(nodes, local_add_hostfile, self.cores_per_node, scale="shrink")
             pid_and_nodes = self.resources[job_id]['pid_and_nodes']
 
-            # Process each node to shrink
+            # FIRST: Write ALL nodes to kill file before sending any signals
+            try:
+                with open(node_to_kill_file_path, 'w') as file:
+                    for node in nodes:
+                        file.write(f"{node.strip()}\n")
+            except Exception as e:
+                logger.error("Failed to write node_to_kill_file: %s", e)
+
+            # THEN: Send signals to all nodes
             for node in nodes:
                 node_stripped = node.strip()
                 matching_entries = [(pid, pid_nodes) for pid, pid_nodes in pid_and_nodes 
-                                  if node_stripped in pid_nodes]
+                                if node_stripped in pid_nodes]
                 
                 if not matching_entries:
                     logger.warning("Node %s not found in job %s resources", node_stripped, job_id)
                     continue
 
-                # Write node to kill file (hint for worker signal handler)
-                try:
-                    with open(node_to_kill_file_path, 'w') as file:
-                        file.write(f"{node_stripped}\n")
-                except Exception as e:
-                    logger.debug("Failed to write node_to_kill_file for %s: %s", node_stripped, e)
-
-                # Terminate processes on this node
                 for pid, pid_nodes in matching_entries:
                     logger.info("Found node %s with pid %s for shrink", node_stripped, pid)
                     
-                    # Send SIGURG hint to worker (gentle shutdown)
                     actual_pid = pid + 1
                     try:
                         os.kill(actual_pid, signal.SIGURG)
@@ -342,31 +342,21 @@ class PMIxProvider(ClusterProvider, RepresentationMixin):
                     except Exception as e:
                         logger.debug("SIGURG to %d failed: %s", actual_pid, e)
 
-                    # Give worker a moment to handle the signal
-                    time.sleep(0.5)
-
-                    # Terminate the process group robustly
-                    try:
-                        pgid = os.getpgid(pid)
-                        if not _terminate_pgid(pgid):
-                            logger.warning("Failed to terminate pgid %s for pid %s", pgid, pid)
-                    except ProcessLookupError:
-                        logger.info("Process %s already exited", pid)
-                    except Exception as e:
-                        logger.warning("Termination failed for pid %s: %s", pid, e)
+                time.sleep(0.5)
 
                 # Remove entries for this node from tracking
                 self.resources[job_id]['pid_and_nodes'] = [
                     (pid, pid_nodes) for pid, pid_nodes in pid_and_nodes 
                     if node_stripped not in pid_nodes
                 ]
-                pid_and_nodes = self.resources[job_id]['pid_and_nodes']  # Update local reference
+                pid_and_nodes = self.resources[job_id]['pid_and_nodes']
 
                 logger.info("Finished shrinkage of jobid: %s with node %s", job_id, node_stripped)
 
             # Optional: Update DVM hostfile to reflect the shrinkage
             while os.path.getsize(node_to_kill_file_path) > 0:
                 time.sleep(1)
+            time.sleep(2)  # Ensure file system sync
             try:
                 run_command = f"prun --dvm-uri file:{dvm_uri} --add-hostfile {local_add_hostfile} -n 1 hostname &"
                 proc = launch(run_command)

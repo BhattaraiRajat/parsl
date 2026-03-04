@@ -438,6 +438,18 @@ class Interchange:
                 else:
                     logger.info(f"Manager {manager_id!r} has compatible Parsl version {msg['parsl_v']}")
                     logger.info(f"Manager {manager_id!r} has compatible Python version {msg['python_v'].rsplit('.', 1)[0]}")
+            
+            elif msg['type'] == 'capacity_update':
+                manager = self._ready_managers.get(manager_id)
+                if manager:
+                    old_capacity = manager['max_capacity']
+                    manager['max_capacity'] = msg['max_capacity']
+                    manager['worker_count'] = msg['worker_count']
+                    logger.info(f"Manager {manager_id!r} updated capacity from {old_capacity} to {manager['max_capacity']}")
+                    interesting_managers.add(manager_id)
+                else:
+                    logger.warning("Received capacity update for not-registered manager %r", manager_id)
+                    
             elif msg['type'] == 'heartbeat':
                 manager = self._ready_managers.get(manager_id)
                 if manager:

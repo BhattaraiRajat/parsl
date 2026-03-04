@@ -3,6 +3,7 @@ import math
 import pickle
 import subprocess
 import threading
+from time import sleep, time
 import typing
 import warnings
 from collections import defaultdict
@@ -799,6 +800,7 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin, UsageIn
             hostname = manager['hostname']
             if hostname in nodes_list:
                 self.hold_worker(manager_id)
+        sleep(2)  # wait for a bit to let the managers finish their current tasks
         self._remove_elastic_nodes_pmix(
             num_nodes, block_id, nodes_list, job_id)
 

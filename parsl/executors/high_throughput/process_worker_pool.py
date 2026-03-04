@@ -340,7 +340,8 @@ class Manager:
         self.ready_worker_count = SpawnContext.Value("i", 0)
 
         self.max_queue_size = self.prefetch_capacity + self.worker_count
-
+        self._total_tasks_received = 0
+        self._total_tasks_completed = 0
         self.tasks_per_round = 1
 
         self.heartbeat_period = heartbeat_period
@@ -394,6 +395,17 @@ class Manager:
         b_msg = json.dumps(msg).encode('utf-8')
         self.task_incoming.send(b_msg)
         logger.debug("Sent heartbeat")
+
+    def send_capacity_update(self):
+        """Send capacity update message to interchange after worker count changes"""
+        msg = {
+            'type': 'capacity_update',
+            'worker_count': self.worker_count,
+            'max_capacity': self.worker_count + self.prefetch_capacity
+        }
+        b_msg = json.dumps(msg).encode('utf-8')
+        self.task_incoming.send(b_msg)
+        logger.info(f"Sent capacity update: workers={self.worker_count}, max_capacity={self.worker_count + self.prefetch_capacity}")
 
     def drain_to_incoming(self):
         """ Send heartbeat to the incoming task queue
@@ -476,6 +488,7 @@ class Manager:
                     kill_event.set()
                 else:
                     task_recv_counter += len(tasks)
+                    self._total_tasks_received += len(tasks)
                     logger.debug("Got executor tasks: {}, cumulative count of tasks: {}".format(
                         [t['task_id'] for t in tasks], task_recv_counter
                     ))
@@ -503,7 +516,7 @@ class Manager:
               Event to let the thread know when it is time to die.
         """
 
-        logger.debug("Starting result push thread")
+        logger.info("Starting result push thread")
 
         push_poll_period = max(10, self.poll_period) / 1000    # push_poll_period must be atleast 10 ms
         logger.debug("push poll period: {}".format(push_poll_period))
@@ -518,6 +531,15 @@ class Manager:
                 r = self.task_scheduler.get_result(block=True, timeout=push_poll_period)
                 logger.debug("Got a result item")
                 items.append(r)
+                # Only count actual task results, not heartbeats or monitoring messages
+                try:
+                    unpickled = pickle.loads(r)
+                    if isinstance(unpickled, dict) and unpickled.get('type') == 'result':
+                        self._total_tasks_completed += 1
+                        logger.debug(f"Task completed. Total: {self._total_tasks_completed}")
+                except Exception:
+                    pass  # Not a result we can parse, ignore
+
             except queue.Empty:
                 logger.debug("pending_result_queue get timeout without result item")
             except Exception as e:
@@ -559,7 +581,7 @@ class Manager:
             worker_change_file = ""
             if os.environ.get('DVM_URI'):
                 dvm_path = os.environ['DVM_URI']
-                preemptive = os.environ.get('PREEMPTIVE', 'True') == 'True'
+                preemptive = os.environ.get('PREEMPTIVE', '').lower() == 'true'
                 script_path = os.path.dirname(dvm_path)
                 worker_change_file = f"{script_path}/worker_change_file"
                 if os.path.exists(worker_change_file) and os.path.getsize(worker_change_file) > 0:
@@ -579,6 +601,9 @@ class Manager:
                             p = self._start_worker(old_worker_count+id)
                             self.procs[old_worker_count+id] = p
                             logger.info("Worker {} has been started".format(old_worker_count+id))
+                        # Send capacity update to interchange
+                        self.send_capacity_update()
+
                     elif scale_type == "shrink":
                         logger.info("Starting worker pool shrinkage")
                         self.worker_count = self.worker_count - worker_change_count
@@ -603,19 +628,45 @@ class Manager:
                                     logger.info("Worker {} was not busy when it was preemptively killed".format(worker_id))
                             else:
                                 logger.info("Waiting for worker {} to be free".format(worker_id))
+                                wait_start = time.time()
+                                max_wait_time = 600  # seconds
                                 while worker_id in self._tasks_in_progress.keys():
-                                    pass
-                                    # time.sleep(2)
+                                    if time.time() - wait_start > max_wait_time:
+                                        logger.warning("Timeout waiting for worker %d to finish task, forcing termination", worker_id)
+                                        # Mark this as a lost task
+                                        try:
+                                            task = self._tasks_in_progress.pop(worker_id)
+                                            logger.info("Worker {} timed out while executing task {}".format(worker_id, task['task_id']))
+                                            try:
+                                                raise WorkerLost(worker_id, platform.node())
+                                            except Exception:
+                                                result_package = {'type': 'result',
+                                                                'task_id': task['task_id'],
+                                                                'exception': serialize(RemoteExceptionWrapper(*sys.exc_info()))}
+                                                pkl_package = pickle.dumps(result_package)
+                                                self.pending_result_queue.put(pkl_package)
+                                        except KeyError:
+                                            pass
+                                        break
+                                    time.sleep(1)
                             self.procs[worker_id].terminate()
                             self.procs[worker_id].join()
                             logger.info("Worker {} joined successfully".format(self.procs[worker_id]))
                             self.procs.pop(worker_id)
                             worker_change_count = worker_change_count-1
+                        # Send capacity update to interchange
+                        self.send_capacity_update()
+
                     else:
                         logger.info("Incorrect Scaling Type")
+                    logger.info("Waiting for change_event to be cleared by worker 0")
+                    wait_count = 0
                     while change_event.is_set():
-                        pass
-                        # time.sleep(2)
+                        time.sleep(0.5)
+                        wait_count += 1
+                        if wait_count % 20 == 0:  # Log every 10 seconds
+                            logger.info("Still waiting for change_event to be cleared, waited %d seconds", wait_count // 2)
+                    logger.info("change_event cleared, worker_watchdog resuming normal operation")
 
             current_procs = self.procs.copy()
             for worker_id, p in current_procs.items():
@@ -661,21 +712,18 @@ class Manager:
 
         while not kill_event.is_set():
             global kill_event_global
+            if kill_event_global:
+                logger.info("Graceful shutdown requested. Waiting for all tasks to complete.")
+                # logger.info("Starting graceful shutdown sequence. Waiting for pending tasks to complete.")
+                preemptive = os.environ.get('PREEMPTIVE', 'True') == 'True'
+                if not preemptive:
+                    # Wait for in-progress tasks to finish
+                    self._wait_for_all_tasks_completion(poll_period_s)
+                # Finally set the kill event to exit
+                logger.info("Setting kill event to terminate manager")
+                kill_event.set()
+                break
             try:
-                if kill_event_global:
-                    logger.info("Starting graceful shutdown sequence. Waiting for pending tasks to complete.")
-                    preemptive = os.environ.get('PREEMPTIVE', 'True') == 'True'
-                    if not preemptive:
-                        # Wait for in-progress tasks to finish
-                        while len(self._tasks_in_progress) > 0:
-                            logger.info(f"Waiting for {len(self._tasks_in_progress)} tasks to complete")
-                            # time.sleep(2)  # Check periodically rather than busy-wait
-                            pass
-                    # Finally set the kill event to exit
-                    logger.info("Setting kill event to terminate manager")
-                    kill_event.set()
-                    break
-
                 logger.debug("Starting monitor_queue.get()")
                 msg = self.monitoring_queue.get(block=True, timeout=poll_period_s)
             except queue.Empty:
@@ -688,6 +736,61 @@ class Manager:
                 logger.debug("Put monitoring message on pending_result_queue")
 
         logger.critical("Exiting")
+
+    def _wait_for_all_tasks_completion(self, check_interval: float):
+        """Wait until all assigned tasks (pending + in-progress) are completed and results sent."""
+        # First, tell interchange to stop sending more tasks
+        if self.drain_time == float('inf'):
+            logger.info("Sending drain request to interchange before graceful shutdown")
+            self.drain_to_incoming()
+            self.drain_time = 0  # Mark as sent
+
+        iteration = 0
+        while True:
+            iteration += 1
+            # Check in-progress tasks (most reliable indicator)
+            in_progress_count = len(self._tasks_in_progress)
+            
+            # Check pending tasks in queue
+            try:
+                pending_count = self.pending_task_queue.qsize()
+            except NotImplementedError:
+                pending_count = 0  # Can't determine on some platforms
+            
+            # Check pending results that haven't been sent yet
+            try:
+                pending_results_count = self.pending_result_queue.qsize()
+            except NotImplementedError:
+                pending_results_count = 0
+            
+            # Task counter difference
+            tasks_remaining = self._total_tasks_received - self._total_tasks_completed
+            
+            logger.info(f"[Iteration {iteration}] Waiting for tasks: "
+                       f"received={self._total_tasks_received}, "
+                       f"completed={self._total_tasks_completed}, "
+                       f"remaining={tasks_remaining}, "
+                       f"in_progress={in_progress_count}, "
+                       f"queue_size={pending_count}, "
+                       f"pending_results={pending_results_count}")
+            
+            # Exit when no tasks are in progress AND no results waiting to be sent
+            if in_progress_count == 0 and pending_count == 0 and pending_results_count == 0:
+                # Give push_results thread a moment to flush any last items
+                time.sleep(check_interval)
+                # Double-check after sleep
+                try:
+                    final_results_count = self.pending_result_queue.qsize()
+                except NotImplementedError:
+                    final_results_count = 0
+                
+                if final_results_count == 0:
+                    logger.info("All tasks completed and results sent")
+                    break
+                else:
+                    logger.info(f"Still have {final_results_count} results pending, continuing to wait")
+            
+            time.sleep(check_interval)
 
     def start(self):
         """ Start the worker processes.
@@ -950,7 +1053,6 @@ def worker(
                 logger.info("Executing resource change in DVM")
                 # wait for dummy tasks to run alone
                 while(len(tasks_in_progress)!=0 or not result_queue.empty()):
-                    # time.sleep(2)
                     pass
                 time.sleep(2) # wait 2s for result processing for safety
                 dvm_path = os.environ['DVM_URI']
@@ -972,8 +1074,7 @@ def worker(
             else:
                 logger.info("Waiting for change event to finish from worker {}".format(worker_id))
                 while (change_event.is_set()):
-                    pass
-                    # time.sleep(2)
+                    time.sleep(0.5)
                 logger.info("Change event finished, resuming normal operation for worker {}".format(worker_id))
 
         if not worker_enqueued:
